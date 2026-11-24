@@ -1,3380 +1,1217 @@
-#!/usr/bin/env python3
-"""
-MiniPix Unified Telegram Bot (SINGLE FILE)
-Combines:
-  • main.py        – Telegram bot framework + Groq Quiz Solver (BEST)
-  • minipix_auto.py – Option 11: Browse ALL + SMART 4x REPEAT Auto-Watch (BEST)
-Features:
-  • Per-user Telegram isolation + busy lock
-  • threading.Lock for shared JSON I/O
-  • Login via OTP, interactive token, or /tokenlogin <token>
-  • 4x reward (15→8→5→3 coins) with daily-cap-aware smart repeat
-  • Groq AI per-user API key for auto quiz (default gpt-oss-120b)
-  • Full login / activity logs to DATA_LOG_CHANNEL
-"""
+"""Professional-Conversion Account Bot — SINGLE FILE (sab kuch isi me).
 
-import os
-import sys
+Chalane ke liye:
+    python profbot\\bot.py
+
+SETUP (ek baar):
+  1) Telegram par @BotFather se NAYA bot banao → token copy karo.
+  2) Project root me .env file banao (repo me `.env.example` dekh lo):
+       BOT_TOKEN=<token>
+       ADMIN_IDS=<apni telegram numeric id>     # bot ko /myid bhejo to pata chal jayegi
+     (Ya hosting platform par yahi env vars set kar do.)
+  3) Chalao:  python profbot\\bot.py
+
+  NOTE: .env file .gitignore me hai — GitHub par push nahi hogi (token safe rahega).
+
+Flow:
+  ADMIN : /admin panel → txt file bhejkar accounts add, /stats, /get (done txt),
+          /errors (problem txt), /users, /adduser <id>, /removeuser <id>, /release <id>
+  USER  : /start → (admin approve karega) → "Get Account" → id+pass (copy) →
+          "Get OTP" (jab chahe, task done hone tak) → "Task Done" → next account
+          ("Problem" dabane par account admin ko submit ho jata hai)
+
+Sab kuch ek hi file: config + TOTP + Telegram API + SQLite storage + bot logic.
+Sirf Python stdlib use hoti hai (urllib, sqlite3, hmac...) — koi pip install nahi.
+"""
+import base64
+import hashlib
+import hmac
+import html
 import json
-import time
+import os
 import re
-import logging
-import asyncio
-import atexit
+import sqlite3
+import struct
 import threading
-from datetime import date
-from typing import Dict, Optional
+import time
+import traceback
+import urllib.request
+import uuid
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
+# ================== CONFIG ==================
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def _load_env_file(path: Path):
+    """Chhota .env loader (koi dependency nahi). Jo pehle se set ho use override nahi karta."""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        if k and k not in os.environ:
+            os.environ[k] = v
+
+
+# .env dhoondo — profbot/.env aur project root .env (dono optional).
+# Hosting par seedhe platform ke env vars (BOT_TOKEN, ADMIN_IDS) set kar dena.
+_load_env_file(BASE_DIR / ".env")
+_load_env_file(BASE_DIR.parent / ".env")
+
+# Naya bot token (BotFather) — .env / env var se
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+
+# Admin telegram numeric ids — comma ya space se alag kar sakte ho
+ADMIN_IDS = {int(x) for x in re.split(r"[,\s]+", os.environ.get("ADMIN_IDS", "")) if x.strip().isdigit()}
+
+DATA_DIR = BASE_DIR / "data"
+EXPORT_DIR = DATA_DIR / "exports"
+DATA_DIR.mkdir(exist_ok=True)
+EXPORT_DIR.mkdir(exist_ok=True)
+
+DB_PATH = DATA_DIR / "profbot.db"
+
+# ---- OTP ----
+OTP_PERIOD = 30     # seconds (standard TOTP)
+OTP_DIGITS = 6
+
+
+# ================== TOTP (RFC 6238) ==================
+def base32_decode(secret: str) -> bytes:
+    """Base32 secret → bytes. Spaces/padding/grouping handle karta hai."""
+    s = (secret or "").strip().replace(" ", "").replace("-", "").upper()
+    s = s.rstrip("=")
+    if not s:
+        raise ValueError("empty 2FA secret")
+    pad = "=" * ((8 - len(s) % 8) % 8)
+    return base64.b32decode(s + pad)
+
+
+def totp(secret: str, digits: int = None, period: int = None, when: float = None) -> str:
+    """Current OTP string (default 6 digits / 30s)."""
+    digits = digits or OTP_DIGITS
+    period = period or OTP_PERIOD
+    key = base32_decode(secret)
+    counter = int((when if when is not None else time.time()) // period)
+    msg = struct.pack(">Q", counter)
+    digest = hmac.new(key, msg, hashlib.sha1).digest()
+    off = digest[-1] & 0x0F
+    code = struct.unpack(">I", digest[off:off + 4])[0] & 0x7FFFFFFF
+    return str(code % (10 ** digits)).zfill(digits)
+
+
+def totp_with_remaining(secret: str, digits: int = None, period: int = None):
+    """Return (otp, seconds_remaining) — user ko batane ke liye kitna time bacha hai."""
+    period = period or OTP_PERIOD
+    now = time.time()
+    remaining = period - int(now % period)
+    return totp(secret, digits, period, now), remaining
+
+
+# ================== TELEGRAM API CLIENT ==================
+class TelegramError(Exception):
     pass
 
-import requests
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters,
-)
 
-_PY_313_PLUS = sys.version_info >= (3, 13)
+class Telegram:
+    def __init__(self, token: str):
+        self.token = token
+        self.base = f"https://api.telegram.org/bot{token}"
+        self.file_base = f"https://api.telegram.org/file/bot{token}"
 
-if _PY_313_PLUS:
-    import weakref as _weakref_mod
-    _orig_weakref_ref = _weakref_mod.ref
+    # ---------- core ----------
+    def call(self, method: str, params: dict = None, timeout: int = 60):
+        url = f"{self.base}/{method}"
+        data = None
+        headers = {}
+        if params is not None:
+            data = json.dumps(params).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+        if not res.get("ok"):
+            raise TelegramError(f"{method} failed: {res}")
+        return res.get("result")
 
-    class _FallbackWeakref:
-        __slots__ = ("_obj", "_cb")
-        def __init__(self, obj, callback=None):
-            self._obj = obj
-            self._cb = callback
-        def __call__(self):
-            return self._obj
-        def __hash__(self):
-            return hash(id(self._obj))
-        def __eq__(self, other):
-            if isinstance(other, _FallbackWeakref):
-                return self._obj is other._obj
-            return NotImplemented
+    # ---------- updates ----------
+    def get_updates(self, offset=None, timeout: int = 30):
+        params = {"timeout": timeout, "allowed_updates": ["message", "callback_query"]}
+        if offset is not None:
+            params["offset"] = offset
+        return self.call("getUpdates", params, timeout=timeout + 20)
 
-    class _MetaPatchedWeakrefRef(type):
-        def __getitem__(cls, item):
-            return cls
-        def __instancecheck__(cls, instance):
-            return isinstance(instance, (cls, _orig_weakref_ref, _FallbackWeakref))
+    def get_me(self):
+        return self.call("getMe")
 
-    def _patched_weakref_ref_factory(cls, o, callback=None):
-        if cls is _PatchedWeakrefRef:
-            try:
-                return _orig_weakref_ref(o, callback)
-            except TypeError:
-                inst = _FallbackWeakref.__new__(_PatchedWeakrefRef)
-                _FallbackWeakref.__init__(inst, o, callback)
-                return inst
-        else:
-            try:
-                return _orig_weakref_ref.__new__(cls, o, callback)
-            except TypeError:
-                return object.__new__(cls)
+    # ---------- sending ----------
+    def send_message(self, chat_id, text: str, reply_markup: dict = None, parse_mode: str = None):
+        params = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+        if parse_mode:
+            params["parse_mode"] = parse_mode
+        if reply_markup:
+            params["reply_markup"] = reply_markup
+        return self.call("sendMessage", params)
 
-    class _PatchedWeakrefRef(_FallbackWeakref, metaclass=_MetaPatchedWeakrefRef):
-        def __new__(cls, o, callback=None):
-            return _patched_weakref_ref_factory(cls, o, callback)
-        def __init__(self, o, callback=None):
-            if not isinstance(self, _FallbackWeakref):
-                return
-            if getattr(self, "_obj", None) is not None and self._obj is o:
-                return
-            _FallbackWeakref.__init__(self, o, callback)
-
-    _weakref_mod.ref = _PatchedWeakrefRef
-
-    class _PatchedWeakKeyDictionary(dict):
-        def __init__(self, *args, **kwargs):
-            super().__init__()
-            if args or kwargs:
-                self.update(*args, **kwargs)
-        def __getitem__(self, key):
-            return super().__getitem__(id(key))
-        def __setitem__(self, key, value):
-            super().__setitem__(id(key), value)
-        def __delitem__(self, key):
-            super().__delitem__(id(key))
-        def __contains__(self, key):
-            return super().__contains__(id(key))
-        def get(self, key, default=None):
-            return super().get(id(key), default)
-        def pop(self, key, *args):
-            return super().pop(id(key), *args)
-        def setdefault(self, key, default=None):
-            return super().setdefault(id(key), default)
-        def update(self, other=None, **kwargs):
-            if other is not None:
-                if hasattr(other, "items"):
-                    for k, v in other.items():
-                        self[k] = v
-                else:
-                    for k, v in other:
-                        self[k] = v
-            for k, v in kwargs.items():
-                self[k] = v
-
-    _weakref_mod.WeakKeyDictionary = _PatchedWeakKeyDictionary
-else:
-    _weakref_mod = None
-
-def _needs_slot_patch(cls):
-    for _c in cls.__mro__:
-        _cls_slots = getattr(_c, "__slots__", None)
-        if isinstance(_cls_slots, (tuple, list)) and "__dict__" in _cls_slots:
-            return False
-    return True
-
-_attr_cache: dict = {}
-
-def _get_attr_cache(self):
-    k = id(self)
-    d = _attr_cache.get(k)
-    if d is None:
-        d = {}
-        _attr_cache[k] = d
-    return d
-
-def _patch_cls_attrs(cls):
-    if not _needs_slot_patch(cls):
-        return
-    if getattr(cls, "_ptb_slots_patched", False):
-        return
-    try:
-        orig_init = cls.__init__
-        orig_setattr = cls.__setattr__
-        orig_getattr = getattr(cls, "__getattr__", None)
-
-        def _patched_setattr(self, name, value):
-            try:
-                orig_setattr(self, name, value)
-            except AttributeError:
-                _get_attr_cache(self)[name] = value
-
-        def _patched_getattr(self, name):
-            if orig_getattr is not None:
-                try:
-                    return orig_getattr(self, name)
-                except AttributeError:
-                    pass
-            d = _attr_cache.get(id(self))
-            if d and name in d:
-                return d[name]
-            raise AttributeError(name)
-
-        def _patched_init(self, *args, **kwargs):
-            orig_init(self, *args, **kwargs)
-
-        cls.__init__ = _patched_init
-        cls.__setattr__ = _patched_setattr
-        cls.__getattr__ = _patched_getattr
-        cls._ptb_slots_patched = True
-    except Exception:
-        pass
-
-if _PY_313_PLUS:
-    _patched_any = False
-    try:
-        from telegram.ext import _updater as _updater_mod
-        _patch_cls_attrs(_updater_mod.Updater)
-        _patched_any = True
-    except Exception as _e:
-        print(f"WARNING: Updater patch skipped: {_e}", file=sys.stderr)
-
-    try:
-        from telegram.ext import _application as _application_mod
-        _patch_cls_attrs(_application_mod.Application)
-        _patched_any = True
-    except Exception as _e:
-        print(f"WARNING: Application patch skipped: {_e}", file=sys.stderr)
-
-    try:
-        from telegram.ext import _jobqueue as _jq_mod
-        _patch_cls_attrs(_jq_mod.JobQueue)
-        _patched_any = True
+    def edit_message_text(self, chat_id, message_id, text: str, reply_markup: dict = None,
+                          parse_mode: str = None):
+        params = {"chat_id": chat_id, "message_id": message_id, "text": text}
+        if parse_mode:
+            params["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            params["reply_markup"] = reply_markup
         try:
-            _orig_set_app = _jq_mod.JobQueue.set_application
-            def _patched_set_app(self, application):
-                try:
-                    _orig_set_app(self, application)
-                except TypeError:
-                    k = id(self)
-                    if not hasattr(_jq_mod, "_fallback_app_refs"):
-                        _jq_mod._fallback_app_refs = {}
-                    _jq_mod._fallback_app_refs[k] = application
-            _jq_mod.JobQueue.set_application = _patched_set_app
-
-            _orig_get_app = _jq_mod.JobQueue._get_application
-            def _patched_get_app(self):
-                try:
-                    return _orig_get_app(self)
-                except Exception:
-                    if hasattr(_jq_mod, "_fallback_app_refs"):
-                        return _jq_mod._fallback_app_refs.get(id(self))
-                    return None
-            _jq_mod.JobQueue._get_application = _patched_get_app
-        except Exception:
-            pass
-    except Exception as _e:
-        print(f"WARNING: JobQueue patch skipped: {_e}", file=sys.stderr)
-
-    try:
-        from telegram.ext import _callbackqueryhandler as _cqh_mod
-        _patch_cls_attrs(_cqh_mod.CallbackQueryHandler)
-        _patched_any = True
-    except Exception:
-        pass
-
-    if not _patched_any:
-        print("INFO: PTB slots patches not needed on this version", file=sys.stderr)
-
-# ───────────────────────── Config ─────────────────────────
-API_BASE = "https://api.minipix.co/v4"
-ACCOUNTS_FILE = "minipix_accounts.json"
-USER_GROQ_FILE = "user_groq_keys.json"
-LOCK_FILE = "bot.lock"
-
-MAX_WATCHES_PER_EP = 4
-REWARDS_BY_WATCH = {1: 15, 2: 8, 3: 5, 4: 3}
-QUIZ_QUESTION_DELAY = 10
-
-GLOBAL_GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")
-DATA_LOG_CHANNEL = LOG_CHANNEL_ID
-
-GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-70b-versatile",
-    "llama-3.1-8b-instant",
-    "mixtral-8x7b-32768",
-    "gemma2-9b-it",
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
-    "qwen/qwen3.8-27b",
-    "qwen/qwen3.6-27b",
-    "allam-2-7b",
-    "llama-3.2-90b-text-preview",
-    "llama-3.2-11b-text-preview",
-    "llama3-groq-70b-8192-tool-use-preview",
-    "llama3-groq-8b-8192-tool-use-preview",
-]
-
-HEADERS_BASE = {
-    "user-agent": "okhttp/4.12.0",
-    "accept-encoding": "gzip",
-}
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-(WAIT_PHONE, WAIT_OTP, WAIT_TOKEN, WAIT_QUIZ_SESSIONS) = range(4)
-
-_accounts_lock = threading.Lock()
-_groq_lock = threading.Lock()
-_busy_locks: Dict[int, threading.Lock] = {}
-_busy_lock_guard = threading.Lock()
-
-
-def _expected_reward(nth_watch):
-    return REWARDS_BY_WATCH.get(int(nth_watch) if nth_watch else 1, 0)
-
-
-def get_user_busy_lock(user_id: int) -> threading.Lock:
-    with _busy_lock_guard:
-        if user_id not in _busy_locks:
-            _busy_locks[user_id] = threading.Lock()
-        return _busy_locks[user_id]
-
-
-# ───────────────────── Lock file ─────────────────────
-def acquire_lock():
-    try:
-        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.close(fd)
-    except FileExistsError:
-        print("Another bot instance is running. Exiting.")
-        sys.exit(1)
-
-    def remove_lock():
-        try:
-            os.unlink(LOCK_FILE)
-        except Exception:
-            pass
-
-    atexit.register(remove_lock)
-
-
-# ───────────────────── Log Channel ─────────────────────
-def send_log_sync(text: str):
-    if not LOG_CHANNEL_ID or not TELEGRAM_BOT_TOKEN:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": LOG_CHANNEL_ID,
-                "text": text[:4090],
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
-            timeout=12,
-        )
-    except Exception as e:
-        logger.warning(f"Log channel error: {e}")
-
-
-# ───────────────────── User Groq Keys ─────────────────────
-def load_user_groq_keys() -> dict:
-    if os.path.exists(USER_GROQ_FILE):
-        try:
-            with _groq_lock:
-                with open(USER_GROQ_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-
-def save_user_groq_keys(data: dict):
-    try:
-        with _groq_lock:
-            with open(USER_GROQ_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logger.error(f"Failed to save groq keys: {e}")
-
-
-user_groq_keys: dict = load_user_groq_keys()
-
-
-def get_user_groq_key(user_id: int) -> Optional[str]:
-    key = user_groq_keys.get(str(user_id))
-    if key:
-        return key
-    return GLOBAL_GROQ_API_KEY or None
-
-
-# ───────────────────── MiniPix Core (UNIFIED) ─────────────────────
-class MiniPixV2:
-    def __init__(self):
-        self.access_token = None
-        self.user_id = None
-        self.profile_id = None
-        self.phone = None
-        self.session = requests.Session()
-        self.session.headers.update(HEADERS_BASE)
-        self.device_id = "65969f0b7041fabc"
-        self.device_info = "Xiaomi"
-        self.watch_history = {}
-        self.watch_history_raw = []
-        self.runtime_watch_counts = {}
-        self.last_profile = {}
-        self.current_account_label = None
-        self.accounts = self._load_accounts()
-
-    def _load_accounts(self):
-        if os.path.exists(ACCOUNTS_FILE):
-            try:
-                with _accounts_lock:
-                    with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                        if isinstance(data, dict):
-                            return (
-                                data.get("accounts", {})
-                                if isinstance(data.get("accounts"), dict)
-                                else data
-                            )
-                        return {}
-            except Exception:
-                return {}
-        return {}
-
-    def _save_accounts(self):
-        payload = {"accounts": self.accounts, "saved_at": date.today().isoformat()}
-        try:
-            with _accounts_lock:
-                with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
-                    json.dump(payload, f, indent=2, ensure_ascii=False)
-                return True
-        except Exception:
-            return False
-
-    def _store_current_account(self, label=None):
-        if not (self.access_token and self.user_id):
-            return False
-        lbl = (
-            label
-            or self.phone
-            or self.current_account_label
-            or f"acc_{str(self.user_id)[-6:]}"
-        )
-        self.current_account_label = lbl
-        self.accounts[lbl] = {
-            "access_token": self.access_token,
-            "user_id": self.user_id,
-            "profile_id": self.profile_id,
-            "phone": self.phone,
-            "added_on": date.today().isoformat(),
-        }
-        return self._save_accounts()
-
-    def list_accounts(self):
-        return list(self.accounts.keys())
-
-    def switch_account(self, label):
-        if label not in self.accounts:
-            return False, f"Account '{label}' not found"
-        acc = self.accounts[label]
-        token = acc.get("access_token")
-        if not token:
-            return False, "No token"
-        self._reset_state()
-        self.access_token = token
-        self.user_id = acc.get("user_id")
-        self.profile_id = acc.get("profile_id")
-        self.phone = acc.get("phone")
-        self.session.headers["authorization"] = f"Bearer {self.access_token}"
-        self.current_account_label = label
-        if self.user_id:
-            ok = self.get_user()
-            if ok:
-                self._store_current_account(label)
-                send_log_sync(
-                    f"🔄 SWITCH ACCOUNT | User <code>{label}</code>\n"
-                    f"Phone: {self.phone or '?'}\n"
-                    f"Balance: {self.get_balance()}"
-                )
-                return True, f"Switched to {label}"
-            return False, "Token expired"
-        return True, f"Switched to {label}"
-
-    def remove_account(self, label):
-        if label not in self.accounts:
-            return False
-        del self.accounts[label]
-        self._save_accounts()
-        if self.current_account_label == label:
-            self._reset_state()
-        return True
-
-    def _reset_state(self):
-        self.access_token = None
-        self.user_id = None
-        self.profile_id = None
-        self.phone = None
-        self.current_account_label = None
-        self.watch_history = {}
-        self.watch_history_raw = []
-        self.runtime_watch_counts = {}
-        self.last_profile = {}
-        if "authorization" in self.session.headers:
-            del self.session.headers["authorization"]
-
-    def _req(self, method, path, **kwargs):
-        url = f"{API_BASE}{path}"
-        try:
-            r = self.session.request(method, url, timeout=30, **kwargs)
-            try:
-                data = r.json()
-            except Exception:
-                data = r.text
-            return r.status_code, data
-        except Exception as e:
-            return 0, str(e)
-
-    # ───────── Login
-    def login_otp_generate(self, phone):
-        self.phone = phone
-        payload = {"phone_number": phone}
-        sc, data = self._req(
-            "POST",
-            "/login/generate-otp",
-            headers={"content-type": "application/json; charset=utf-8"},
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        )
-        send_log_sync(
-            f"📡 OTP generate response:\n"
-            f"Status: {sc}\n"
-            f"Data: {json.dumps(data, ensure_ascii=False)[:500]}"
-        )
-        if sc == 200 and isinstance(data, dict):
-            if data.get("message") == "OTP sent" or data.get("success"):
-                return data.get("session_token") or data.get("sessionToken")
-            else:
-                error_msg = data.get("message") or data.get("error") or "Unknown error"
-                send_log_sync(f"❌ OTP generation failed: {error_msg}")
-        else:
-            send_log_sync(f"❌ OTP generation HTTP {sc}: {str(data)[:200]}")
-        return None
-
-    def login_otp_verify(self, session_token, otp, save_label=None):
-        payload = {
-            "client_id": "android",
-            "device_id": self.device_id,
-            "device_info": self.device_info,
-            "otp": otp,
-            "phone_number": self.phone,
-            "session_token": session_token,
-        }
-        sc, data = self._req(
-            "POST",
-            "/login/verify-otp",
-            headers={"content-type": "application/json; charset=utf-8"},
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        )
-        if sc == 200 and isinstance(data, dict) and data.get("access_token"):
-            self.access_token = data["access_token"]
-            self.user_id = data.get("id") or data.get("_id")
-            self.session.headers["authorization"] = f"Bearer {self.access_token}"
-            self.get_user()
-            self._store_current_account(save_label)
-            ref_code = (
-                data.get("referralCode")
-                or data.get("referral_code")
-                or (isinstance(data.get("user"), dict) and data["user"].get("referralCode"))
-            )
-            ref_by = (
-                data.get("referredBy")
-                or data.get("referred_by")
-                or (isinstance(data.get("user"), dict) and data["user"].get("referredBy"))
-            )
-            source = data.get("source")
-            send_log_sync(
-                f"✅ OTP LOGIN SUCCESS\n"
-                f"User ID: <code>{self.user_id}</code>\n"
-                f"Phone: {self.phone or '?'}\n"
-                f"referralCode: {ref_code or '-'}\n"
-                f"referredBy: {ref_by or '-'}\n"
-                f"source: {source or '-'}\n"
-                f"Balance: {self.get_balance()}\n"
-                f"<pre>{json.dumps(data, ensure_ascii=False)[:600]}</pre>"
-            )
-            return True
-        send_log_sync(
-            f"❌ OTP verify failed: {sc} {json.dumps(data, ensure_ascii=False)[:300]}"
-        )
-        return False
-
-    def login_with_token(self, token, user_id=None, profile_id=None, label=None):
-        self.access_token = token
-        self.user_id = user_id
-        self.profile_id = profile_id
-        self.session.headers["authorization"] = f"Bearer {self.access_token}"
-        raw = None
-        sc = 0
-        if self.user_id:
-            sc, raw = self._req("GET", f"/users/{self.user_id}")
-        if not self.get_user():
-            return False
-        self._store_current_account(label)
-        ref_code = None
-        ref_by = None
-        source = None
-        if isinstance(raw, dict):
-            ref_code = raw.get("referralCode") or raw.get("referral_code")
-            ref_by = raw.get("referredBy") or raw.get("referred_by")
-            source = raw.get("source") or raw.get("signupSource")
-        send_log_sync(
-            f"✅ TOKEN LOGIN SUCCESS\n"
-            f"User ID: <code>{self.user_id}</code>\n"
-            f"Phone: {self.phone or '?'}\n"
-            f"referralCode: {ref_code or '-'}\n"
-            f"referredBy: {ref_by or '-'}\n"
-            f"source: {source or '-'}\n"
-            f"Balance: {self.get_balance()}"
-        )
-        return True
-
-    def get_user(self):
-        if not self.user_id:
-            return False
-        sc, data = self._req("GET", f"/users/{self.user_id}")
-        if sc == 200 and isinstance(data, dict):
-            self.user_id = data.get("_id", self.user_id)
-            self.profile_id = data.get("master_profile", self.profile_id)
-            phone = data.get("mobile")
-            if phone and not self.phone:
-                self.phone = phone
-            return True
-        return False
-
-    def open_app(self):
-        if not (self.user_id and self.profile_id):
-            return False
-        payload = {"openApp": {"_id": self.user_id, "date": date.today().isoformat()}}
-        sc, data = self._req(
-            "PATCH",
-            f"/users/{self.user_id}/profiles/{self.profile_id}/open_app",
-            headers={"content-type": "application/json; charset=utf-8"},
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        )
-        return sc == 200 and isinstance(data, dict) and data.get("success")
-
-    def get_balance(self):
-        sc, data = self._req("GET", "/coins/balance")
-        if sc == 200 and isinstance(data, dict):
-            coins = data.get("coins", 0)
-            if isinstance(coins, dict):
-                coins = coins.get("coins", 0)
-            return coins
-        if sc == 200 and isinstance(data, (int, float)):
-            return int(data)
-        return None
-
-    def get_balance_silent(self):
-        return self.get_balance()
-
-    def get_campaign_status(self):
-        sc, data = self._req("GET", "/watch-campaign/status")
-        if sc == 200 and isinstance(data, dict) and data.get("success"):
-            cap = data.get("dailyVideoCap", {}) or {}
-            return {
-                "enabled": data.get("enabled", False),
-                "cap": cap.get("cap", 0),
-                "used": cap.get("used", 0),
-                "reached": cap.get("reached", False),
-                "blockWatching": cap.get("blockWatching", False),
-            }
-        return {
-            "enabled": False,
-            "cap": 0,
-            "used": 0,
-            "reached": False,
-            "blockWatching": False,
-        }
-
-    # ───────── Series / Episodes discovery (from minipix_auto Option 11)
-    def _collect_series_deep(self, obj, out_dict):
-        if obj is None:
-            return
-        if isinstance(obj, dict):
-            if (obj.get("_id") or obj.get("id") or obj.get("series_id")) and (
-                obj.get("title")
-                or obj.get("numberOfEpisodes") is not None
-                or obj.get("totalEpisodes") is not None
-                or obj.get("watchLadderEnabled") is not None
-                or obj.get("cardImage")
-                or obj.get("hindiTitle")
-            ):
-                sid = obj.get("_id") or obj.get("id") or obj.get("series_id")
-                if sid and sid not in out_dict:
-                    out_dict[sid] = obj
-            for v in obj.values():
-                self._collect_series_deep(v, out_dict)
-        elif isinstance(obj, list):
-            for item in obj:
-                self._collect_series_deep(item, out_dict)
-
-    def get_all_series(self, page_size=100, max_pages=20):
-        found = {}
-        tried = 0
-        home_urls = [
-            ("GET", "/short_search?page=home", False),
-        ]
-        for method, tmpl, _p in home_urls:
-            tried += 1
-            try:
-                sc, data = self._req(method, tmpl)
-            except Exception:
-                sc, data = 0, None
-            if sc == 200 and isinstance(data, (dict, list)):
-                self._collect_series_deep(data, found)
-        endpoints = [
-            ("GET", "/webseries?page={p}&pageSize={ps}", True),
-            ("GET", "/discover?type=webseries&page={p}&pageSize={ps}", True),
-            ("GET", "/home?page={p}&pageSize={ps}", False),
-            ("GET", "/discover/webseries?page={p}&pageSize={ps}", True),
-            ("GET", "/series?page={p}&pageSize={ps}", True),
-            ("GET", "/content?type=webseries&page={p}&pageSize={ps}", True),
-        ]
-        for method, tmpl, is_series_list in endpoints:
-            for page in range(1, max_pages + 1):
-                url = tmpl.format(p=page, ps=page_size)
-                tried += 1
-                try:
-                    sc, data = self._req(method, url)
-                except Exception:
-                    continue
-                if not (sc == 200 and isinstance(data, dict)):
-                    continue
-                self._collect_series_deep(data, found)
-                series_candidates = []
-                for k in (
-                    "webseries",
-                    "series",
-                    "data",
-                    "items",
-                    "results",
-                    "contents",
-                    "list",
-                ):
-                    if isinstance(data.get(k), list):
-                        series_candidates.extend(data[k])
-                inner = None
-                if isinstance(data.get("data"), dict):
-                    inner = data["data"]
-                elif isinstance(data.get("response"), dict):
-                    inner = data["response"]
-                if inner:
-                    for k in (
-                        "webseries",
-                        "series",
-                        "items",
-                        "results",
-                        "contents",
-                        "list",
-                        "data",
-                    ):
-                        if isinstance(inner.get(k), list):
-                            series_candidates.extend(inner[k])
-                if not series_candidates:
-                    if (
-                        is_series_list
-                        and isinstance(data, dict)
-                        and (data.get("_id") or data.get("title"))
-                    ):
-                        series_candidates = [data]
-                if not series_candidates:
-                    break
-                for s in series_candidates:
-                    if not isinstance(s, dict):
-                        continue
-                    sid = s.get("_id") or s.get("id") or s.get("series_id")
-                    if not sid:
-                        continue
-                    if sid not in found:
-                        found[sid] = s
-                total_reported = data.get("total") or (inner or {}).get("total") or 0
-                if total_reported and len(found) >= int(total_reported):
-                    break
-                if len(series_candidates) < int(page_size * 0.5):
-                    break
-
-        series_list = list(found.values())
-
-        def _sort_key(s):
-            try:
-                return -int(s.get("numberOfEpisodes") or s.get("totalEpisodes") or 0)
-            except Exception:
-                return 0
-
-        series_list.sort(key=_sort_key)
-        return series_list
-
-    def get_series(self, series_id):
-        sc, data = self._req("GET", f"/webseries/{series_id}")
-        if sc == 200 and isinstance(data, dict) and data.get("success"):
-            return data
-        return None
-
-    def get_episodes(self, series_id, page=1, page_size=50):
-        sc, data = self._req(
-            "GET",
-            f"/episodes?series_id={series_id}&page={page}&pageSize={page_size}",
-        )
-        if sc == 200 and isinstance(data, dict):
-            return data.get("episodes", []), data.get("total", 0)
-        return [], 0
-
-    def get_profile(self):
-        if not (self.user_id and self.profile_id):
+            return self.call("editMessageText", params)
+        except TelegramError:
             return None
-        sc, data = self._req(
-            "GET", f"/users/{self.user_id}/profiles/{self.profile_id}"
-        )
-        if sc == 200 and isinstance(data, dict):
-            profile = data.get("profile", {}) or {}
-            self.last_profile = profile
-            history = (
-                profile.get("watchHistory", [])
-                or profile.get("watched", [])
-                or []
-            )
-            if not isinstance(history, list):
-                history = []
-            self.watch_history_raw = list(history)
-            self.watch_history = {}
-            for wh in history:
-                if not isinstance(wh, dict):
-                    continue
-                key = (wh.get("id"), wh.get("episodeNo"))
-                prev = self.watch_history.get(key) or {"watchedPct": 0, "time": 0}
-                cur_pct = wh.get("watchedPct", 0) or 0
-                cur_time = wh.get("time", 0) or 0
-                if cur_pct >= (prev.get("watchedPct") or 0):
-                    self.watch_history[key] = {
-                        "watchedPct": cur_pct,
-                        "time": cur_time,
-                    }
-            return profile
-        return None
 
-    def get_watched_set_from_profile(self):
-        watched = set()
-        counts = self.get_watch_counts_from_profile()
-        for k, c in counts.items():
-            if c >= 1:
-                watched.add(k)
-        return watched
-
-    def get_watch_counts_from_profile(self):
-        counts = {}
-        raw_history = []
+    def answer_callback(self, callback_id, text: str = None, show_alert: bool = False):
+        params = {"callback_query_id": callback_id}
+        if text:
+            params["text"] = text
+        if show_alert:
+            params["show_alert"] = True
         try:
-            self.get_profile()
-        except Exception:
-            pass
-        profile = getattr(self, "last_profile", None) or {}
-        if isinstance(profile, dict):
-            watched_list = (
-                profile.get("watched") or profile.get("watchHistory") or []
-            )
-            if isinstance(watched_list, list):
-                raw_history = watched_list
-        if isinstance(getattr(self, "watch_history_raw", None), list):
-            raw_history = raw_history + self.watch_history_raw
-        for item in raw_history:
-            if not isinstance(item, dict):
-                continue
-            sid = item.get("id") or item.get("series_id")
-            ep = item.get("episodeNo") or item.get("episode_no")
-            pct = int(item.get("watchedPct") or item.get("progress") or 0)
-            if sid and ep and pct >= 80:
-                k = (str(sid), str(ep))
-                counts[k] = counts.get(k, 0) + 1
-        if isinstance(self.watch_history, dict):
-            for (sid, ep_no), info in self.watch_history.items():
-                pct = (
-                    int(info.get("watchedPct") or 0)
-                    if isinstance(info, dict)
-                    else 0
-                )
-                if pct >= 80:
-                    k = (str(sid), str(ep_no))
-                    if counts.get(k, 0) < 1:
-                        counts[k] = max(counts.get(k, 0), 1)
-        runtime = getattr(self, "runtime_watch_counts", None)
-        if isinstance(runtime, dict):
-            for k, c in runtime.items():
-                counts[k] = max(counts.get(k, 0), c)
-        return counts
-
-    # ───────── Unlock episode (from minipix_auto)
-    def unlock_episode(self, series_id, ep_id, ep_no, playback_url=None):
-        if not (series_id and ep_id):
-            return False
-        ok = False
-        unlock_candidates = [
-            (
-                "POST",
-                f"/episodes/{ep_id}/unlock",
-                {"series_id": series_id, "episodeNo": ep_no, "campaign": False},
-            ),
-            (
-                "POST",
-                "/episodes/unlock",
-                {
-                    "series_id": series_id,
-                    "episode_id": ep_id,
-                    "episodeNo": ep_no,
-                    "campaign": False,
-                },
-            ),
-            (
-                "POST",
-                f"/webseries/{series_id}/episodes/{ep_no}/unlock",
-                {"campaign": False},
-            ),
-            (
-                "POST",
-                "/coins/unlock-episode",
-                {
-                    "series_id": series_id,
-                    "episode_id": ep_id,
-                    "episodeNo": ep_no,
-                },
-            ),
-            (
-                "POST",
-                "/watch-campaign/unlock",
-                {"seriesId": series_id, "episode_id": ep_id, "campaign": False},
-            ),
-        ]
-        for method, path, body in unlock_candidates:
-            try:
-                sc, d = self._req(
-                    method,
-                    path,
-                    headers={"content-type": "application/json; charset=utf-8"},
-                    data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-                )
-                if sc and sc < 500 and isinstance(d, dict):
-                    if d.get("success") is True:
-                        ok = True
-                        break
-                    if sc == 200 and d.get("unlocked"):
-                        ok = True
-                        break
-                    if sc == 200 and "success" not in d:
-                        ok = True
-                        break
-            except Exception:
-                continue
-        return ok
-
-    # ───────── Watch progress + coin report (from minipix_auto Option 11)
-    def _update_watch_progress(
-        self,
-        series_id,
-        series_title,
-        hindi_title,
-        episode_no,
-        tc_in_ms,
-        tc_out_ms,
-        detail_image,
-        watched_pct,
-        campaign=False,
-    ):
-        if not (self.user_id and self.profile_id):
-            return False
-        try:
-            watched_pct = int(watched_pct or 0)
-        except Exception:
-            watched_pct = 0
-        if not tc_in_ms:
-            tc_in_ms = 0
-        if not tc_out_ms or tc_out_ms <= tc_in_ms:
-            tc_out_ms = tc_in_ms + 60000
-        duration = tc_out_ms - tc_in_ms
-        if watched_pct >= 100:
-            current_time_ms = tc_out_ms
-        else:
-            current_time_ms = int(tc_in_ms + (duration * watched_pct / 100))
-        if watched_pct == 99:
-            stored_pct = 99
-        elif watched_pct >= 100:
-            stored_pct = 100
-        else:
-            stored_pct = watched_pct
-        watch_obj = {
-            "id": series_id,
-            "title": series_title,
-            "hindiTitle": hindi_title,
-            "episodeNo": episode_no,
-            "tcInMs": tc_in_ms,
-            "tcOutMs": tc_out_ms,
-            "detailImage": detail_image,
-            "type": "episode",
-            "progress": 100 if watched_pct >= 100 else watched_pct,
-            "time": current_time_ms,
-            "watchedPct": stored_pct,
-            "campaign": False,
-        }
-        ok1 = False
-        try:
-            payload_patch = {"watched": watch_obj}
-            sc1, d1 = self._req(
-                "PATCH",
-                f"/users/{self.user_id}/profiles/{self.profile_id}",
-                headers={"content-type": "application/json; charset=utf-8"},
-                data=json.dumps(payload_patch, ensure_ascii=False).encode("utf-8"),
-            )
-            ok1 = sc1 == 200 and isinstance(d1, dict) and d1.get("success")
-        except Exception:
-            pass
-
-        ok2 = False
-        try:
-            for path in (
-                f"/users/{self.user_id}/profiles/{self.profile_id}/watch-history/update",
-                "/watch-history/update",
-                f"/profiles/{self.profile_id}/watch-history/update",
-            ):
-                payload_wh = {"watched": watch_obj, "campaign": False}
-                sc2, d2 = self._req(
-                    "POST",
-                    path,
-                    headers={"content-type": "application/json; charset=utf-8"},
-                    data=json.dumps(payload_wh, ensure_ascii=False).encode("utf-8"),
-                )
-                if sc2 and sc2 < 500:
-                    if isinstance(d2, dict) and d2.get("success"):
-                        ok2 = True
-                        break
-                    if sc2 == 200:
-                        ok2 = True
-                        break
-        except Exception:
-            pass
-        return ok1 or ok2
-
-    def _report_watch_progress_to_coins(
-        self, series_id, episode_no, watched_pct, series_title=""
-    ):
-        if not (self.user_id and self.profile_id):
-            return False
-        try:
-            watched_pct = int(watched_pct or 0)
-        except Exception:
-            watched_pct = 0
-        ep_str = str(episode_no)
-        bodies = [
-            {
-                "series_id": series_id,
-                "episode_no": episode_no,
-                "episodeNo": episode_no,
-                "progress": watched_pct,
-                "watchedPct": watched_pct,
-                "campaign": False,
-                "task_type": "watch_ladder",
-            },
-            {
-                "type": "watch_ladder",
-                "seriesId": series_id,
-                "episode": ep_str,
-                "watched": watched_pct,
-                "campaign": False,
-            },
-            {
-                "task_id": f"watch_ladder_{series_id}",
-                "progress_delta": 1,
-                "series_id": series_id,
-                "episode_no": episode_no,
-                "campaign": False,
-            },
-        ]
-        endpoints = [
-            ("POST", "/coins/progress-report", bodies[0]),
-            ("POST", "/coins/tasks/progress", bodies[0]),
-            ("POST", f"/coins/tasks/watch_ladder_{series_id}/progress", bodies[0]),
-            ("POST", "/coins/watch-progress", bodies[1]),
-            ("POST", "/coins/report-watched", bodies[1]),
-            ("POST", "/coins/tasks/update", bodies[2]),
-            ("POST", "/watch-ladder/progress", bodies[0]),
-        ]
-        any_ok = False
-        for method, path, body in endpoints:
-            try:
-                sc, d = self._req(
-                    method,
-                    path,
-                    headers={"content-type": "application/json; charset=utf-8"},
-                    data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-                )
-                if sc and sc < 500 and isinstance(d, dict):
-                    if d.get("success") is True:
-                        any_ok = True
-                        break
-                    if sc == 200 and "success" not in d:
-                        any_ok = True
-                        break
-            except Exception:
-                continue
-        return any_ok
-
-    def _start_task_for_series(self, series_id):
-        task_id = f"watch_ladder_{series_id}"
-        candidates = [
-            (
-                "POST",
-                f"/coins/tasks/{task_id}/start",
-                {"series_id": series_id, "campaign": False},
-            ),
-            (
-                "POST",
-                "/coins/tasks/start",
-                {"task_id": task_id, "series_id": series_id, "campaign": False},
-            ),
-            ("POST", "/watch-ladder/start", {"series_id": series_id, "campaign": False}),
-            (
-                "POST",
-                "/coins/start-task",
-                {"task_id": task_id, "campaign": False},
-            ),
-            ("POST", f"/coins/tasks/watch_ladder_{series_id}/resume", {}),
-        ]
-        any_ok = False
-        for method, path, body in candidates:
-            try:
-                sc, d = self._req(
-                    method,
-                    path,
-                    headers={"content-type": "application/json; charset=utf-8"},
-                    data=json.dumps(body, ensure_ascii=False).encode("utf-8") if body else None,
-                )
-                if sc and sc < 500:
-                    if isinstance(d, dict) and d.get("success") is True:
-                        any_ok = True
-                        break
-                    if sc == 200:
-                        any_ok = True
-                        break
-            except Exception:
-                pass
-        return any_ok
-
-    def watch_campaign_select_series(self, series_id):
-        payload = {
-            "seriesId": series_id,
-            "series_id": series_id,
-            "campaign": False,
-        }
-        candidates = [
-            ("POST", "/watch-campaign/session/start", payload),
-            ("POST", "/watch-campaign/start", payload),
-            ("POST", "/watch-campaign/select-series", payload),
-            ("POST", "/watch-campaign/select", payload),
-            ("PUT", "/watch-campaign/select", payload),
-            ("PATCH", "/watch-campaign/select", payload),
-            ("POST", "/watch-ladder/start-session", payload),
-            ("POST", "/campaigns/watch/start", {"series_id": series_id}),
-        ]
-        confirmed = False
-        for method, path, body in candidates:
-            try:
-                sc, data = self._req(
-                    method,
-                    path,
-                    headers={"content-type": "application/json; charset=utf-8"},
-                    data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-                )
-                if sc and sc < 500 and isinstance(data, dict):
-                    if data.get("success"):
-                        confirmed = True
-                        break
-                    if sc == 200:
-                        confirmed = True
-                        break
-            except Exception:
-                pass
-        if confirmed:
-            try:
-                self._start_task_for_series(series_id)
-            except Exception:
-                pass
-        else:
-            try:
-                self._start_task_for_series(series_id)
-            except Exception:
-                pass
-        return True
-
-    def claim_reward_task(self, task_id=None, series_id=None):
-        if not task_id and series_id:
-            task_id = f"watch_ladder_{series_id}"
-        if series_id:
-            try:
-                self._report_watch_progress_to_coins(series_id, 0, 100)
-            except Exception:
-                pass
-        candidates = []
-        if task_id:
-            candidates.append(("POST", f"/coins/tasks/{task_id}/claim", None))
-            candidates.append(
-                ("POST", "/coins/tasks/claim", {"task_id": task_id, "campaign": False})
-            )
-            candidates.append(("POST", f"/coins/tasks/{task_id}/reward", None))
-            candidates.append(("POST", f"/coins/tasks/{task_id}/complete", {}))
-            candidates.append(
-                ("POST", "/coins/tasks/complete", {"task_id": task_id, "campaign": False})
-            )
-        if series_id:
-            candidates.append(
-                ("POST", f"/watch-ladder/claim", {"series_id": series_id, "campaign": False})
-            )
-            candidates.append(("POST", f"/coins/watch-ladder/{series_id}/claim", None))
-            candidates.append(
-                (
-                    "POST",
-                    f"/coins/claim",
-                    {"series_id": series_id, "type": "watch_ladder", "campaign": False},
-                )
-            )
-            candidates.append(
-                (
-                    "POST",
-                    "/coins/redeem",
-                    {"series_id": series_id, "task": "watch_ladder", "campaign": False},
-                )
-            )
-            candidates.append(
-                ("POST", f"/watch-ladder/{series_id}/complete", {"campaign": False})
-            )
-        any_ok = False
-        last_msg = ""
-        for entry in candidates:
-            method, path = entry[0], entry[1]
-            body = entry[2] if len(entry) > 2 else None
-            try:
-                sc, data = self._req(
-                    method,
-                    path,
-                    headers={"content-type": "application/json; charset=utf-8"},
-                    data=json.dumps(body, ensure_ascii=False).encode("utf-8") if body else None,
-                )
-                if sc and sc < 500 and isinstance(data, dict):
-                    if data.get("success") is True:
-                        any_ok = True
-                        break
-                    if data.get("success") is False:
-                        last_msg = (
-                            data.get("message")
-                            or data.get("error")
-                            or str(data)[:80]
-                        )
-                    if sc == 200 and "success" not in data:
-                        continue
-                elif sc and sc < 500 and isinstance(data, str):
-                    if sc == 200 and len(data or "") > 0:
-                        any_ok = True
-                        break
-            except Exception:
-                continue
-        return any_ok
-
-    def refresh_tasks_and_balance(self):
-        try:
-            self.get_balance()
-        except Exception:
-            pass
-        sc, data = self._req("GET", "/coins/tasks?all=1")
-        updated = []
-        if sc == 200 and isinstance(data, dict):
-            tasks = data.get("tasks") or data.get("data") or []
-            if isinstance(tasks, dict):
-                tasks = tasks.get("tasks") or []
-            for t in tasks if isinstance(tasks, list) else []:
-                if isinstance(t, dict) and t.get("task_type") == "watch_ladder":
-                    updated.append(t)
-        return updated
-
-    # ───────── Watch episode (UPGRADED from minipix_auto Option 11)
-    def watch_episode(
-        self,
-        episode,
-        series_info,
-        delay_multiplier=0.0,
-        campaign=False,
-        min_watch_pct=80,
-        allow_repeat=False,
-        nth_watch=None,
-    ):
-        if not isinstance(series_info, dict):
-            return False, "invalid_series"
-        if not isinstance(episode, dict):
-            return False, "invalid_episode"
-        series_id = (
-            series_info.get("_id")
-            or series_info.get("id")
-            or series_info.get("series_id")
-        )
-        if not series_id:
-            return False, "no_series_id"
-        ep_no = (
-            episode.get("episodeNo")
-            or episode.get("episode_no")
-            or episode.get("number")
-            or 0
-        )
-        series_title = series_info.get("title") or ""
-        hindi_title = series_info.get("hindiTitle") or series_title
-        detail_image = (
-            series_info.get("cardImage") or series_info.get("longVerticalImage") or ""
-        )
-        try:
-            tc_in = int(episode.get("tcIn") or 0)
-        except Exception:
-            tc_in = 0
-        try:
-            tc_out = int(episode.get("tcOut") or (tc_in + 60))
-        except Exception:
-            tc_out = tc_in + 60
-        if tc_out <= tc_in:
-            tc_out = tc_in + 60
-        tc_in_ms = tc_in * 1000
-        tc_out_ms = tc_out * 1000
-        dur_sec = tc_out - tc_in
-        history_key = (series_id, ep_no)
-        current_pct = int(
-            self.watch_history.get(history_key, {}).get("watchedPct", 0) or 0
-        )
-        if not allow_repeat and current_pct >= min_watch_pct:
-            return True, "skip"
-
-        if not episode.get("coinUnlocked", True):
-            ep_id = episode.get("_id") or episode.get("id")
-            url = episode.get("playbackUrl")
-            try:
-                self.unlock_episode(series_id, ep_id, ep_no, playback_url=url)
-            except Exception:
-                pass
-
-        progress_steps = [1, 50, 80, 99, 100, 100]
-        any_fail = False
-        reported_coin_progress = False
-        for pct in progress_steps:
-            if not allow_repeat and pct < current_pct:
-                continue
-            ok = self._update_watch_progress(
-                series_id,
-                series_title,
-                hindi_title,
-                ep_no,
-                tc_in_ms,
-                tc_out_ms,
-                detail_image,
-                pct,
-                campaign=False,
-            )
-            if not ok:
-                any_fail = True
-            if pct >= 80 and not reported_coin_progress:
-                try:
-                    self._report_watch_progress_to_coins(
-                        series_id, ep_no, pct, series_title
-                    )
-                    reported_coin_progress = True
-                except Exception:
-                    pass
-            if delay_multiplier > 0:
-                try:
-                    idx_cur = progress_steps.index(pct)
-                    prev_pct = progress_steps[idx_cur - 1] if idx_cur > 0 else 0
-                    delta = pct - prev_pct
-                    delay = dur_sec * delay_multiplier * delta / 100
-                    if delay > 0:
-                        time.sleep(min(delay, 2))
-                except Exception:
-                    time.sleep(0.15)
-            else:
-                time.sleep(0.15)
-        if not reported_coin_progress:
-            try:
-                self._report_watch_progress_to_coins(series_id, ep_no, 100, series_title)
-            except Exception:
-                pass
-        try:
-            self.claim_reward_task(series_id=series_id, task_id=None)
-        except Exception:
-            pass
-        time.sleep(0.5)
-        self.watch_history[history_key] = {"watchedPct": 100, "time": tc_out_ms}
-        rk = (str(series_id), str(ep_no))
-        self.runtime_watch_counts[rk] = self.runtime_watch_counts.get(rk, 0) + 1
-        self.watch_history_raw.append(
-            {
-                "id": series_id,
-                "series_id": series_id,
-                "episodeNo": ep_no,
-                "episode_no": ep_no,
-                "watchedPct": 100,
-                "progress": 100,
-                "time": tc_out_ms,
-            }
-        )
-        return True, "done"
-
-    # ─────────────────── OPTION 11: Browse ALL + SMART 4x REPEAT Watch (BEST)
-    def browse_and_watch_all_smart_repeat(
-        self,
-        progress_callback=None,
-        max_watches=250,
-        telegram_user_id=None,
-    ):
-        def log(msg):
-            if progress_callback:
-                try:
-                    progress_callback(msg)
-                except Exception:
-                    pass
-            if any(
-                x in msg
-                for x in [
-                    "→",
-                    "finished",
-                    "Campaign",
-                    "Fetching",
-                    "Soft limit",
-                    "▶️",
-                    "🏁",
-                    "📊",
-                    "🛑",
-                ]
-            ):
-                send_log_sync(
-                    f"<b>🎬 WATCH (Opt11)</b> | User <code>{telegram_user_id}</code>\n{msg[:1800]}"
-                )
-
-        log(
-            f"🌐 Option 11 mode: Browse ALL + SMART 4x REPEAT\n"
-            f"Rewards/ep: 1st=+15 | 2nd=+8 | 3rd=+5 | 4th=+3\n"
-            f"Checking campaign..."
-        )
-        cap_status = self.get_campaign_status()
-        daily_used = cap_status.get("used", 0)
-        daily_cap = cap_status.get("cap", 0)
-        log(
-            f"Campaign: {'ON' if cap_status['enabled'] else 'OFF'} | "
-            f"{cap_status['used']}/{cap_status['cap']} "
-            f"{'[REACHED]' if cap_status['reached'] else ''}"
-        )
-
-        log("Fetching all series (multi-endpoint)...")
-        all_series = self.get_all_series()
-        if not all_series:
-            return {"error": "No series found"}
-
-        try:
-            self.get_profile()
-        except Exception:
-            pass
-        watch_counts = self.get_watch_counts_from_profile()
-
-        def _ep_key(e):
-            n = e.get("episodeNo")
-            try:
-                return int(n)
-            except Exception:
-                try:
-                    return float(n)
-                except Exception:
-                    return 0
-
-        total_watched_all = 0
-        total_skip_all = 0
-        total_fail_all = 0
-        balance_before = self.get_balance_silent()
-
-        def _check_daily_cap(local_watched):
-            if daily_cap and daily_cap > 0:
-                total_today = daily_used + local_watched
-                if (
-                    total_today >= daily_cap
-                    or cap_status.get("reached")
-                    or cap_status.get("blockWatching")
-                ):
-                    log(
-                        f"🛑 DAILY CAP REACHED! ({daily_used}+{local_watched} >= cap {daily_cap}) Stop."
-                    )
-                    return True
-            return False
-
-        log(f"Series found: {len(all_series)}. Smart-repeat mode = ALL series, 4x each ep.")
-
-        for idx, s in enumerate(all_series, 1):
-            if max_watches is not None and total_watched_all >= max_watches:
-                log(f"🛑 Soft limit reached ({max_watches} watches total).")
-                break
-            if _check_daily_cap(total_watched_all):
-                break
-
-            sid = s.get("_id") or s.get("id") or s.get("series_id")
-            if not sid:
-                continue
-            title = s.get("title") or s.get("name") or "(no title)"
-            n_total = int(s.get("numberOfEpisodes") or s.get("totalEpisodes") or 0)
-
-            log(f"=== Series {idx}/{len(all_series)}: {title} (id={sid}) ===")
-
-            try:
-                real_info = self.get_series(sid) or s
-                real_sid = (
-                    (real_info or {}).get("_id")
-                    or (real_info or {}).get("id")
-                    or sid
-                )
-                episodes, _ = self.get_episodes(
-                    real_sid, page=1, page_size=max(200, n_total or 500)
-                )
-                episodes_sorted = (
-                    sorted(episodes, key=_ep_key) if episodes else []
-                )
-            except Exception:
-                real_info = s
-                real_sid = sid
-                episodes_sorted = []
-
-            if not episodes_sorted:
-                log("  ⚠️ No episodes — skip series.")
-                continue
-
-            try:
-                self.watch_campaign_select_series(real_sid)
-            except Exception:
-                pass
-            try:
-                self._start_task_for_series(real_sid)
-            except Exception:
-                pass
-
-            series_done = series_skip = series_fail = 0
-            any_series_progress = True
-            loop_count = 0
-            while any_series_progress:
-                loop_count += 1
-                any_series_progress = False
-                if loop_count > MAX_WATCHES_PER_EP + 1:
-                    break
-                for ep in episodes_sorted:
-                    if max_watches is not None and total_watched_all >= max_watches:
-                        break
-                    if _check_daily_cap(total_watched_all):
-                        break
-                    ep_no = (
-                        ep.get("episodeNo") or ep.get("episode_no") or 0
-                    )
-                    key_pair = (str(real_sid), str(ep_no))
-                    cur_count = watch_counts.get(key_pair, 0)
-                    if cur_count >= MAX_WATCHES_PER_EP:
-                        continue
-                    nth = cur_count + 1
-                    try:
-                        ok, status = self.watch_episode(
-                            ep,
-                            real_info or s,
-                            allow_repeat=True,
-                            nth_watch=nth,
-                        )
-                    except Exception:
-                        ok, status = False, "exception"
-                    if status == "skip":
-                        series_skip += 1
-                    elif ok:
-                        series_done += 1
-                        total_watched_all += 1
-                        watch_counts[key_pair] = nth
-                        any_series_progress = True
-                    else:
-                        series_fail += 1
-
-            total_skip_all += series_skip
-            total_fail_all += series_fail
-            log(
-                f"  [{title}] → Done: {series_done} | Skip: {series_skip} | Fail: {series_fail}"
-            )
-
-            try:
-                self.claim_reward_task(series_id=real_sid)
-            except Exception:
-                pass
-            try:
-                refreshed_counts = self.get_watch_counts_from_profile()
-                for k, c in refreshed_counts.items():
-                    if c > watch_counts.get(k, 0):
-                        watch_counts[k] = c
-            except Exception:
-                pass
-
-        bal_end = self.get_balance_silent()
-        delta = None
-        if balance_before is not None and bal_end is not None:
-            delta = bal_end - balance_before
-
-        summary = (
-            f"<b>🏁 WATCH (Opt11) FINISHED</b>\n"
-            f"User: <code>{telegram_user_id}</code>\n"
-            f"Watched: {total_watched_all} | Skipped: {total_skip_all} | Failed: {total_fail_all}\n"
-        )
-        if delta is not None:
-            summary += (
-                f"Balance: {balance_before} → {bal_end} ({delta:+d})"
-            )
-        send_log_sync(summary)
-
-        return {
-            "watched": total_watched_all,
-            "skipped": total_skip_all,
-            "failed": total_fail_all,
-            "balance_before": balance_before,
-            "balance_after": bal_end,
-            "delta": delta,
-        }
-
-    # ─────────────────── PER-SERIES Smart Watch (user requested specific series)
-    def get_series_list_paginated(self, page=1, per_page=10):
-        all_series = self.get_all_series() or []
-        total = len(all_series)
-        total_pages = max(1, (total + per_page - 1) // per_page)
-        page = max(1, min(int(page or 1), total_pages))
-        start = (page - 1) * per_page
-        return (
-            all_series[start : start + per_page],
-            total,
-            total_pages,
-            page,
-        )
-
-    def get_series_detail(self, series_id):
-        info = self.get_series(series_id)
-        eps, total = self.get_episodes(series_id, page=1, page_size=500)
-        try:
-            self.get_profile()
-        except Exception:
-            pass
-        counts = self.get_watch_counts_from_profile()
-        ep_status = []
-        for ep in eps:
-            ep_no = str(ep.get("episodeNo") or ep.get("episode_no") or 0)
-            key = (str(series_id), ep_no)
-            c = counts.get(key, 0)
-            ep_status.append(
-                {
-                    "episode": ep,
-                    "watches": c,
-                    "maxed": c >= MAX_WATCHES_PER_EP,
-                }
-            )
-        return {
-            "series": info,
-            "episodes": eps,
-            "ep_status": ep_status,
-            "total_episodes": total or len(eps),
-            "watch_counts": counts,
-        }
-
-    def watch_single_series_smart_repeat(
-        self,
-        series_id,
-        progress_callback=None,
-        max_watches=None,
-        telegram_user_id=None,
-    ):
-        def log(msg):
-            if progress_callback:
-                try:
-                    progress_callback(msg)
-                except Exception:
-                    pass
-            if any(
-                x in msg
-                for x in [
-                    "→",
-                    "finished",
-                    "Fetching",
-                    "Soft limit",
-                    "▶️",
-                    "🏁",
-                    "🛑",
-                    "📊",
-                ]
-            ):
-                send_log_sync(
-                    f"<b>🎬 WATCH (Series)</b> | User <code>{telegram_user_id}</code> | sid=<code>{series_id}</code>\n{msg[:1800]}"
-                )
-
-        log(f"🎯 Specific series mode: id={series_id}\nRewards/ep: 15→8→5→3")
-        cap_status = self.get_campaign_status()
-        daily_used = cap_status.get("used", 0)
-        daily_cap = cap_status.get("cap", 0)
-        log(
-            f"Campaign: {'ON' if cap_status['enabled'] else 'OFF'} | "
-            f"{daily_used}/{daily_cap} {'[REACHED]' if cap_status['reached'] else ''}"
-        )
-
-        real_info = self.get_series(series_id) or {}
-        real_sid = (
-            (real_info or {}).get("_id")
-            or (real_info or {}).get("id")
-            or series_id
-        )
-        title = (real_info or {}).get("title") or (real_info or {}).get("name") or f"Series {real_sid}"
-        log(f"Fetching episodes for: {title}")
-        try:
-            self.get_profile()
-        except Exception:
-            pass
-        watch_counts = self.get_watch_counts_from_profile()
-        eps, _ = self.get_episodes(real_sid, page=1, page_size=500)
-
-        def _ep_key(e):
-            n = e.get("episodeNo")
-            try:
-                return int(n)
-            except Exception:
-                try:
-                    return float(n)
-                except Exception:
-                    return 0
-
-        episodes_sorted = sorted(eps, key=_ep_key) if eps else []
-        if not episodes_sorted:
-            return {"error": "Series me koi episodes nahi mile."}
-
-        try:
-            self.watch_campaign_select_series(real_sid)
-        except Exception:
-            pass
-        try:
-            self._start_task_for_series(real_sid)
-        except Exception:
-            pass
-
-        balance_before = self.get_balance_silent()
-        total_watched_all = total_skip = total_fail = 0
-        max_allowed = (
-            max_watches
-            if max_watches is not None
-            else MAX_WATCHES_PER_EP * max(1, len(episodes_sorted))
-        )
-
-        def _check_daily_cap(local):
-            if daily_cap and daily_cap > 0:
-                if (
-                    daily_used + local >= daily_cap
-                    or cap_status.get("reached")
-                    or cap_status.get("blockWatching")
-                ):
-                    log(
-                        f"🛑 DAILY CAP REACHED! ({daily_used}+{local} >= {daily_cap}) Stop."
-                    )
-                    return True
-            return False
-
-        any_series_progress = True
-        loop_count = 0
-        while any_series_progress:
-            loop_count += 1
-            any_series_progress = False
-            if loop_count > MAX_WATCHES_PER_EP + 1:
-                break
-            for ep in episodes_sorted:
-                if total_watched_all >= max_allowed:
-                    log(f"🛑 Soft limit ({max_allowed} watches).")
-                    break
-                if _check_daily_cap(total_watched_all):
-                    break
-                ep_no = ep.get("episodeNo") or ep.get("episode_no") or 0
-                key_pair = (str(real_sid), str(ep_no))
-                cur_count = watch_counts.get(key_pair, 0)
-                if cur_count >= MAX_WATCHES_PER_EP:
-                    continue
-                nth = cur_count + 1
-                try:
-                    ok, status = self.watch_episode(
-                        ep,
-                        real_info or {},
-                        allow_repeat=True,
-                        nth_watch=nth,
-                    )
-                except Exception:
-                    ok, status = False, "exception"
-                if status == "skip":
-                    total_skip += 1
-                elif ok:
-                    total_watched_all += 1
-                    watch_counts[key_pair] = nth
-                    any_series_progress = True
-                else:
-                    total_fail += 1
-
-        try:
-            self.claim_reward_task(series_id=real_sid)
-        except Exception:
-            pass
-        bal_end = self.get_balance_silent()
-        delta = None
-        if balance_before is not None and bal_end is not None:
-            delta = bal_end - balance_before
-
-        summary = (
-            f"<b>🏁 WATCH (Series) FINISHED</b>\n"
-            f"User: <code>{telegram_user_id}</code>\n"
-            f"Series: {title} (<code>{real_sid}</code>)\n"
-            f"Watched: {total_watched_all} | Skip: {total_skip} | Fail: {total_fail}\n"
-        )
-        if delta is not None:
-            summary += f"Balance: {balance_before} → {bal_end} ({delta:+d})"
-        send_log_sync(summary)
-
-        return {
-            "series_id": real_sid,
-            "series_title": title,
-            "watched": total_watched_all,
-            "skipped": total_skip,
-            "failed": total_fail,
-            "balance_before": balance_before,
-            "balance_after": bal_end,
-            "delta": delta,
-        }
-
-    def watch_one_episode(
-        self,
-        series_id,
-        episode_no,
-        progress_callback=None,
-        telegram_user_id=None,
-    ):
-        def log(msg):
-            if progress_callback:
-                try:
-                    progress_callback(msg)
-                except Exception:
-                    pass
-            send_log_sync(
-                f"<b>🎬 WATCH (1 Ep)</b> | User <code>{telegram_user_id}</code> | S{series_id} E{episode_no}\n{msg[:1800]}"
-            )
-
-        log(f"▶️ Single ep: S{series_id} E{episode_no}")
-        cap_status = self.get_campaign_status()
-        real_info = self.get_series(series_id) or {}
-        real_sid = (
-            (real_info or {}).get("_id")
-            or (real_info or {}).get("id")
-            or series_id
-        )
-        eps, _ = self.get_episodes(real_sid, page=1, page_size=500)
-        target = None
-        for e in eps:
-            en = str(e.get("episodeNo") or e.get("episode_no") or "")
-            if en == str(episode_no):
-                target = e
-                break
-        if not target:
-            return {"error": f"Episode {episode_no} series {series_id} me nahi mila."}
-        try:
-            self.watch_campaign_select_series(real_sid)
-        except Exception:
-            pass
-        try:
-            self._start_task_for_series(real_sid)
-        except Exception:
-            pass
-        try:
-            self.get_profile()
-        except Exception:
-            pass
-        counts = self.get_watch_counts_from_profile()
-        key_pair = (str(real_sid), str(episode_no))
-        cur_count = counts.get(key_pair, 0)
-        if cur_count >= MAX_WATCHES_PER_EP:
-            return {
-                "error": f"Episode already {MAX_WATCHES_PER_EP}x watched. No more reward."
-            }
-        nth = cur_count + 1
-        bal_before = self.get_balance_silent()
-        try:
-            ok, status = self.watch_episode(
-                target, real_info or {}, allow_repeat=True, nth_watch=nth
-            )
-        except Exception as ee:
-            ok, status = False, f"exception: {ee}"
-        try:
-            self.claim_reward_task(series_id=real_sid)
-        except Exception:
-            pass
-        bal_end = self.get_balance_silent()
-        delta = None
-        if bal_before is not None and bal_end is not None:
-            delta = bal_end - bal_before
-        reward_label = _expected_reward(nth)
-        log(
-            f"Result: ok={ok} status={status} nth={nth} (+{reward_label} expected) delta={delta}"
-        )
-        return {
-            "ok": ok,
-            "status": status,
-            "nth_watch": nth,
-            "reward_expected": reward_label,
-            "balance_before": bal_before,
-            "balance_after": bal_end,
-            "delta": delta,
-        }
-
-    # ─────────────────── QUIZ (from main.py – GROQ BEST)
-    def get_quiz_status(self):
-        sc, data = self._req("GET", "/quiz/status")
-        if sc == 200 and isinstance(data, dict) and data.get("success"):
-            return data
-        return None
-
-    def quiz_start_session(self):
-        sc, data = self._req(
-            "POST",
-            "/quiz/session/start",
-            headers={"content-type": "application/json; charset=utf-8"},
-            data=json.dumps({}).encode("utf-8"),
-        )
-        send_log_sync(
-            f"📡 quiz/session/start response:\n"
-            f"Status: {sc}\n"
-            f"Data: {json.dumps(data, ensure_ascii=False)[:500]}"
-        )
-        if sc == 200 and isinstance(data, dict):
-            if data.get("success") is True or data.get("status") == "success":
-                session_obj = data.get("session") or {}
-                question_obj = data.get("question")
-                sid = (
-                    session_obj.get("sessionId")
-                    or data.get("sessionId")
-                    or data.get("_id")
-                )
-                if not question_obj:
-                    question_obj = (
-                        data.get("data", {}).get("question")
-                        or data.get("next", {}).get("question")
-                    )
-                if sid and question_obj:
-                    return sid, question_obj, session_obj
-                else:
-                    send_log_sync(
-                        f"⚠️ Missing sessionId or question in response.\n"
-                        f"sid={sid}, question_obj={question_obj is not None}"
-                    )
-            else:
-                send_log_sync(
-                    f"❌ Quiz start returned success=False: {data.get('message', data)}"
-                )
-        else:
-            send_log_sync(f"❌ Quiz start HTTP {sc}: {str(data)[:300]}")
-        return None, None, None
-
-    def quiz_submit_answer(self, session_id, question_id, chosen_index):
-        payload = {
-            "sessionId": session_id,
-            "questionId": question_id,
-            "chosenIndex": chosen_index,
-        }
-        sc, data = self._req(
-            "POST",
-            "/quiz/session/answer",
-            headers={"content-type": "application/json; charset=utf-8"},
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        )
-        if sc == 200 and isinstance(data, dict):
-            return data
-        return None
-
-    def quiz_use_lifeline(self, session_id, question_id):
-        payload = {"sessionId": session_id, "questionId": question_id}
-        sc, data = self._req(
-            "POST",
-            "/quiz/session/lifeline",
-            headers={"content-type": "application/json; charset=utf-8"},
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        )
-        if sc == 200 and isinstance(data, dict) and data.get("success"):
-            return data.get("removedOptions", [])
-        return None
-
-    def quiz_ad_ack(self, session_id):
-        payload = {"sessionId": session_id}
-        sc, data = self._req(
-            "POST",
-            "/quiz/session/ad-ack",
-            headers={"content-type": "application/json; charset=utf-8"},
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        )
-        if sc == 200 and isinstance(data, dict) and data.get("success"):
-            return data.get("question")
-        return None
-
-    def _build_quiz_prompt(self, question, options):
-        prompt = (
-            "Solve this multiple-choice question. "
-            "Return ONLY the integer index of the correct option (0, 1, 2, ...). "
-            "No explanation, no extra words, just a single digit integer.\n\n"
-            f"Question (both Hindi and English provided):\n"
-            f"{question}\n\n"
-            "Options:\n"
-        )
-        for i, opt in enumerate(options):
-            prompt += f"  {i}: {opt}\n"
-        prompt += "\nCorrect option index (integer only): "
-        return prompt
-
-    def _parse_quiz_answer(self, answer_text, options):
-        if not answer_text:
+            return self.call("answerCallbackQuery", params)
+        except TelegramError:
             return None
-        t = answer_text.strip()
-        m = re.search(r"\b(\d+)\b", t)
-        if m:
-            idx = int(m.group(1))
-            if 0 <= idx < len(options):
-                return idx
-        for i, opt in enumerate(options):
-            opt_clean = str(opt).strip().lower()
-            if opt_clean and opt_clean in t.lower():
-                return i
-        m2 = re.search(r"option\s*(\d+)", t, flags=re.IGNORECASE)
-        if m2:
-            idx = int(m2.group(1))
-            if 1 <= idx <= len(options):
-                return idx - 1
-        return None
 
-    def ask_groq(self, question, options, telegram_user_id: int = None):
-        api_key = (
-            get_user_groq_key(telegram_user_id)
-            if telegram_user_id
-            else GLOBAL_GROQ_API_KEY
+    def send_chat_action(self, chat_id, action: str = "typing"):
+        try:
+            return self.call("sendChatAction", {"chat_id": chat_id, "action": action})
+        except TelegramError:
+            return None
+
+    # ---------- files ----------
+    def get_file_path(self, file_id: str) -> str:
+        res = self.call("getFile", {"file_id": file_id})
+        return res["file_path"]
+
+    def download_file(self, file_id: str) -> bytes:
+        fp = self.get_file_path(file_id)
+        url = f"{self.file_base}/{fp}"
+        with urllib.request.urlopen(url, timeout=120) as resp:
+            return resp.read()
+
+    def send_document(self, chat_id, file_path, caption: str = None):
+        file_path = Path(file_path)
+        content = file_path.read_bytes()
+        boundary = "----profbot" + uuid.uuid4().hex
+
+        def _field(name, value):
+            return (f"--{boundary}\r\n"
+                    f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                    f"{value}\r\n").encode("utf-8")
+
+        body = b""
+        body += _field("chat_id", str(chat_id))
+        if caption:
+            body += _field("caption", caption)
+        body += (f"--{boundary}\r\n"
+                 f'Content-Disposition: form-data; name="document"; '
+                 f'filename="{file_path.name}"\r\n'
+                 f"Content-Type: text/plain\r\n\r\n").encode("utf-8")
+        body += content
+        body += f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+        req = urllib.request.Request(
+            f"{self.base}/sendDocument", data=body, method="POST",
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
         )
-        if not api_key:
-            send_log_sync(f"❌ No Groq key for user <code>{telegram_user_id}</code>")
-            return None, None, None
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+        if not res.get("ok"):
+            raise TelegramError(f"sendDocument failed: {res}")
+        return res.get("result")
 
-        prompt = self._build_quiz_prompt(question, options)
-        n_opts = len(options)
-        systems = [
-            (
-                "You are a smart quiz solver. "
-                "Read the question and options carefully. "
-                "Reply with ONLY a single integer number (0, 1, 2 or 3). "
-                "Do not write any explanation or extra text."
-            ),
-            (
-                f"Return ONLY the index of the correct option. "
-                f"There are exactly {n_opts} options (0 to {n_opts-1}). "
-                "Reply with a single integer, nothing else."
-            ),
-            (
-                "Choose the correct option index. "
-                f"Possible answers: 0-{n_opts-1}. Reply just the number."
-            ),
-        ]
 
-        for model in GROQ_MODELS:
-            for sys_i, sys_msg in enumerate(systems):
-                try:
-                    from groq import Groq
+tg = Telegram(BOT_TOKEN)
 
-                    client = Groq(api_key=api_key)
-                    completion = client.chat.completions.create(
-                        model=model,
-                        messages=[
-                            {"role": "system", "content": sys_msg},
-                            {"role": "user", "content": prompt},
-                        ],
-                        temperature=0.0,
-                        max_tokens=20,
-                    )
-                    answer_text = (completion.choices[0].message.content or "").strip()
-                    idx = self._parse_quiz_answer(answer_text, options)
-                    if idx is not None:
-                        tag = f"{model}" if sys_i == 0 else f"{model}/s{sys_i+1}"
-                        return idx, tag, answer_text
-                except Exception as e:
-                    err = str(e).lower()
-                    if "rate" in err or "limit" in err or "quota" in err or "429" in err:
-                        send_log_sync(f"⏳ Model {model} rate‑limited, trying next.")
-                        break
-                    logger.warning(f"Model {model} attempt {sys_i+1} failed: {e}")
-                    continue
 
-        http_models = [m for m in GROQ_MODELS if "/" not in m][:8] or GROQ_MODELS[:8]
-        for model in http_models:
-            try:
-                r = requests.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": model,
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": f"Reply with ONLY one number between 0 and {n_opts-1}. Nothing else.",
-                            },
-                            {"role": "user", "content": prompt},
-                        ],
-                        "temperature": 0.0,
-                        "max_tokens": 10,
-                    },
-                    timeout=45,
-                )
-                if r.status_code == 200:
-                    try:
-                        answer_text = r.json()["choices"][0]["message"]["content"].strip()
-                        idx = self._parse_quiz_answer(answer_text, options)
-                        if idx is not None:
-                            return idx, f"http:{model}", answer_text
-                    except Exception:
-                        pass
-            except Exception as e:
-                logger.warning(f"HTTP model {model} fallback error: {e}")
-                continue
+# ================== STORAGE (SQLite) ==================
+# Tables:
+#   users    → telegram users (approval + display info)
+#   accounts → account pool (username/password/2FA secret) + status/assignment
+# Account status flow:  available → assigned → done → archived
 
-        return None, None, None
+_db_lock = threading.Lock()
 
-    def run_quiz_auto(
-        self,
-        max_sessions=3,
-        question_delay=QUIZ_QUESTION_DELAY,
-        progress_callback=None,
-        telegram_user_id=None,
-    ):
-        def log(msg):
-            if progress_callback:
-                try:
-                    progress_callback(msg)
-                except Exception:
-                    pass
 
-        if not self.user_id:
-            if not self.get_user():
-                return {"error": "User not authenticated. Re-login required."}
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        status = self.get_quiz_status()
-        if not status:
-            return {"error": "Could not fetch quiz status"}
-        daily = status.get("dailyAttempts", {}) or {}
-        if daily.get("exhausted"):
-            return {"error": "Daily quiz attempts exhausted"}
 
-        total_coins = 0
-        sessions_done = 0
-        debug_lines = []
-        failed_attempts = 0
+@contextmanager
+def _conn():
+    c = sqlite3.connect(str(DB_PATH), timeout=30)
+    c.row_factory = sqlite3.Row
+    try:
+        yield c
+        c.commit()
+    finally:
+        c.close()
 
-        send_log_sync(
-            f"🧠 QUIZ STARTED | User <code>{telegram_user_id}</code> | Sessions: {max_sessions}"
+
+def db_init():
+    with _conn() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id  INTEGER PRIMARY KEY,
+                username     TEXT,
+                first_name   TEXT,
+                approved     INTEGER DEFAULT 0,
+                blocked      INTEGER DEFAULT 0,
+                requested_at TEXT,
+                added_at     TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS accounts (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                username     TEXT UNIQUE,
+                password     TEXT,
+                twofa_secret TEXT,
+                session_id   TEXT,
+                email        TEXT,
+                status       TEXT DEFAULT 'available',
+                assigned_to  INTEGER,
+                assigned_at  TEXT,
+                done_by      INTEGER,
+                done_at      TEXT,
+                error_by     INTEGER,
+                error_at     TEXT,
+                added_at     TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
+            CREATE INDEX IF NOT EXISTS idx_accounts_assigned ON accounts(assigned_to);
+            """
         )
 
-        for session_num in range(1, max_sessions + 1):
-            log(f"--- Session {session_num}/{max_sessions} ---")
 
-            session_id, question_obj, session_meta = None, None, None
-            for attempt in range(2):
-                session_id, question_obj, session_meta = self.quiz_start_session()
-                if session_id and question_obj:
-                    break
-                if attempt == 0:
-                    log("⚠️ Session start failed, retrying in 3s...")
-                    time.sleep(3)
-
-            if not session_id or not question_obj:
-                log("❌ Failed to start session after retry")
-                send_log_sync(
-                    f"❌ Session start failed | User <code>{telegram_user_id}</code>"
-                )
-                failed_attempts += 1
-                if failed_attempts >= 2:
-                    log("Aborting: too many failed attempts to start session.")
-                    break
-                time.sleep(3)
-                continue
-
-            hearts = session_meta.get("hearts", 3) if session_meta else 3
-
-            if hearts == 0:
-                log(f"💔 Session has 0 hearts – cannot continue.")
-                failed_attempts += 1
-                if failed_attempts >= 2:
-                    log("Aborting: repeated dead sessions.")
-                    break
-                time.sleep(5)
-                continue
-
-            failed_attempts = 0
-            ad_every = session_meta.get("adGateEvery", 5) if session_meta else 5
-            q_count = 0
-            session_coins = 0
-            correct_count = 0
-            wrong_count = 0
-
-            while True:
-                if hearts <= 0:
-                    log("No hearts left")
-                    break
-                if not question_obj or not isinstance(question_obj, dict):
-                    break
-
-                q_id = question_obj.get("questionId")
-                q_text_hi = question_obj.get("questionHi") or ""
-                q_text_en = question_obj.get("questionEn") or ""
-                options = question_obj.get("options", [])
-                q_idx = question_obj.get("index", q_count)
-                q_total = question_obj.get("total", "?")
-
-                q_count += 1
-                combined = q_text_hi
-                if q_text_en and q_text_en != q_text_hi:
-                    combined = (
-                        f"{q_text_hi}\n[EN: {q_text_en}]" if q_text_hi else q_text_en
-                    )
-
-                if not q_id or len(options) < 2:
-                    send_log_sync(
-                        f"⚠️ Invalid question: q_id={q_id}, options={len(options)}"
-                    )
-                    break
-
-                correct_index, model_used, raw_answer = self.ask_groq(
-                    combined, options, telegram_user_id=telegram_user_id
-                )
-                if correct_index is None:
-                    send_log_sync(
-                        f"❌ All models failed for Q{q_idx+1}/{q_total} (id={q_id}). Skipping submit, hearts -=1."
-                    )
-                    log(
-                        f"⚠️  Q{q_idx+1}: All models failed → -1 heart."
-                    )
-                    wrong_count += 1
-                    hearts -= 1
-                    debug_lines.append(
-                        f"Q{q_idx+1}/{q_total}: ❌ SKIP | Model: ALL FAILED | Raw: N/A | Chose: SKIP | -1 heart"
-                    )
-                    if len(debug_lines) > 15:
-                        debug_lines.pop(0)
-                    continue
-
-                correct_index = max(0, min(correct_index, len(options) - 1))
-                chosen_text = options[correct_index]
-
-                time.sleep(question_delay)
-
-                result = self.quiz_submit_answer(
-                    session_id, q_id, correct_index
-                )
-                if not result:
-                    break
-
-                if result.get("success"):
-                    correct_flag = result.get("correct", False)
-                    coins_earned = int(result.get("coinsEarned") or 0)
-                    session_coins = result.get("coinsSoFar", 0)
-                    hearts = int(result.get("hearts", hearts))
-                    total_coins += coins_earned
-                    if correct_flag:
-                        correct_count += 1
-                    else:
-                        wrong_count += 1
-
-                    status_emoji = "✅" if correct_flag else "❌"
-                    correct_idx_server = result.get("correctIndex")
-                    correct_server_text = ""
-                    if correct_idx_server is not None:
-                        try:
-                            correct_server_text = f" (Correct: {correct_idx_server} '{options[correct_idx_server]}')"
-                        except Exception:
-                            pass
-                    debug_line = (
-                        f"Q{q_idx+1}/{q_total}: {status_emoji} | "
-                        f"Model: {model_used} | Raw: '{raw_answer[:30]}' | "
-                        f"Chose: [{correct_index}] {chosen_text}{correct_server_text} | "
-                        f"+{coins_earned}¢ | hearts {hearts}"
-                    )
-                    send_log_sync(f"<b>{debug_line}</b>")
-                    debug_lines.append(debug_line)
-                    if len(debug_lines) > 15:
-                        debug_lines.pop(0)
-
-                    user_debug = "\n".join(debug_lines)
-                    log(f"--- Quiz running ---\n{user_debug}")
-
-                    next_info = result.get("next")
-                    if not next_info:
-                        log(f"Session complete • {session_coins} coins")
-                        break
-
-                    if isinstance(next_info, dict):
-                        if "question" in next_info and isinstance(
-                            next_info.get("question"), dict
-                        ):
-                            question_obj = next_info["question"]
-                            session_id = result.get("sessionId") or session_id
-                            continue
-                        if "result" in next_info:
-                            break
-                        if next_info.get("questionId"):
-                            question_obj = next_info
-                            session_id = result.get("sessionId") or session_id
-                            continue
-
-                    if q_count > 0 and ad_every > 0 and (q_count % ad_every == 0):
-                        nq = self.quiz_ad_ack(session_id)
-                        if nq and isinstance(nq, dict):
-                            question_obj = nq
-                            continue
-                        else:
-                            break
-                    break
-                else:
-                    break
-
-            session_summary = (
-                f"🏁 Session {session_num} finished\n"
-                f"Questions: {q_count}  |  Correct: {correct_count}  |  Wrong: {wrong_count}\n"
-                f"Coins earned: {session_coins}"
+# ---------- users ----------
+def upsert_user(tid: int, username: str = "", first_name: str = ""):
+    with _db_lock, _conn() as c:
+        row = c.execute("SELECT telegram_id FROM users WHERE telegram_id=?", (tid,)).fetchone()
+        if row:
+            c.execute("UPDATE users SET username=?, first_name=? WHERE telegram_id=?",
+                      (username, first_name, tid))
+        else:
+            c.execute(
+                "INSERT INTO users(telegram_id, username, first_name, approved, requested_at, added_at) "
+                "VALUES(?,?,?,0,?,?)",
+                (tid, username, first_name, now_str(), now_str()),
             )
-            log(session_summary)
-            send_log_sync(f"<b>{session_summary}</b>")
 
-            sessions_done += 1
-            if session_num < max_sessions:
-                time.sleep(2)
 
-        final = (
-            f"<b>🏁 QUIZ FINISHED</b>\n"
-            f"User: <code>{telegram_user_id}</code>\n"
-            f"Sessions: {sessions_done}\n"
-            f"Total coins earned: ~{total_coins}\n"
-            f"Balance now: {self.get_balance()}"
+def get_user(tid: int):
+    with _conn() as c:
+        r = c.execute("SELECT * FROM users WHERE telegram_id=?", (tid,)).fetchone()
+        return dict(r) if r else None
+
+
+def is_approved(tid: int) -> bool:
+    with _conn() as c:
+        r = c.execute("SELECT approved FROM users WHERE telegram_id=?", (tid,)).fetchone()
+        return bool(r and r["approved"])
+
+
+def set_approved(tid: int, approved: bool, username: str = "", first_name: str = ""):
+    with _db_lock, _conn() as c:
+        row = c.execute("SELECT telegram_id FROM users WHERE telegram_id=?", (tid,)).fetchone()
+        if row:
+            c.execute("UPDATE users SET approved=?, blocked=0 WHERE telegram_id=?",
+                      (1 if approved else 0, tid))
+        else:
+            c.execute(
+                "INSERT INTO users(telegram_id, username, first_name, approved, added_at) "
+                "VALUES(?,?,?,?,?)",
+                (tid, username, first_name, 1 if approved else 0, now_str()),
+            )
+
+
+def remove_user(tid: int) -> bool:
+    with _db_lock, _conn() as c:
+        cur = c.execute("DELETE FROM users WHERE telegram_id=?", (tid,))
+        return cur.rowcount > 0
+
+
+def list_users():
+    with _conn() as c:
+        rows = c.execute("SELECT * FROM users ORDER BY approved DESC, added_at").fetchall()
+        return [dict(r) for r in rows]
+
+
+# ---------- accounts ----------
+def add_accounts(rows: list) -> tuple:
+    """rows = [{username,password,twofa_secret,session_id,email}] → (added, skipped)."""
+    added = skipped = 0
+    with _db_lock, _conn() as c:
+        for r in rows:
+            u = (r.get("username") or "").strip().lstrip("@")
+            p = (r.get("password") or "").strip()
+            if not u or not p:
+                skipped += 1
+                continue
+            try:
+                cur = c.execute(
+                    "INSERT INTO accounts(username, password, twofa_secret, session_id, email, "
+                    "status, added_at) VALUES(?,?,?,?,?, 'available', ?)",
+                    (u, p, (r.get("twofa_secret") or "").strip(),
+                     (r.get("session_id") or "").strip(),
+                     (r.get("email") or "").strip(), now_str()),
+                )
+                if cur.rowcount:
+                    added += 1
+                else:
+                    skipped += 1
+            except sqlite3.IntegrityError:
+                skipped += 1
+    return added, skipped
+
+
+def stats() -> dict:
+    with _conn() as c:
+        rows = c.execute("SELECT status, COUNT(*) n FROM accounts GROUP BY status").fetchall()
+        d = {"available": 0, "assigned": 0, "done": 0, "archived": 0, "error": 0}
+        for r in rows:
+            d[r["status"]] = r["n"]
+        d["total"] = sum(d.values())
+        return d
+
+
+def assign_account(tid: int):
+    """Ek available account user ko do (atomic). None agar available nahi."""
+    with _db_lock, _conn() as c:
+        r = c.execute("SELECT * FROM accounts WHERE status='available' ORDER BY id LIMIT 1").fetchone()
+        if not r:
+            return None
+        c.execute("UPDATE accounts SET status='assigned', assigned_to=?, assigned_at=? WHERE id=?",
+                  (tid, now_str(), r["id"]))
+        d = dict(r)
+        d["status"] = "assigned"
+        d["assigned_to"] = tid
+        return d
+
+
+def get_active_for_user(tid: int):
+    """User ke paas jo abhi assigned account hai (ek hi hoga)."""
+    with _conn() as c:
+        r = c.execute(
+            "SELECT * FROM accounts WHERE status='assigned' AND assigned_to=? ORDER BY id LIMIT 1",
+            (tid,),
+        ).fetchone()
+        return dict(r) if r else None
+
+
+def mark_done(username: str, tid: int) -> bool:
+    with _db_lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE accounts SET status='done', done_at=?, done_by=?, assigned_to=NULL "
+            "WHERE username=? AND status='assigned'",
+            (now_str(), tid, username),
         )
-        send_log_sync(final)
-
-        return {
-            "sessions": sessions_done,
-            "total_coins": total_coins,
-            "balance": self.get_balance(),
-        }
+        return cur.rowcount > 0
 
 
-# ───────────────────── Per-user instances ─────────────────────
-user_bots: Dict[int, MiniPixV2] = {}
-_user_bots_lock = threading.Lock()
+def release_user(tid: int) -> int:
+    """User ka assigned account wapas available kar do."""
+    with _db_lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE accounts SET status='available', assigned_to=NULL, assigned_at=NULL "
+            "WHERE status='assigned' AND assigned_to=?",
+            (tid,),
+        )
+        return cur.rowcount
 
 
-def get_bot(user_id: int) -> MiniPixV2:
-    with _user_bots_lock:
-        if user_id not in user_bots:
-            user_bots[user_id] = MiniPixV2()
-        return user_bots[user_id]
+def report_problem(username: str, tid: int) -> bool:
+    """User ne 'problem/not complete' report kiya → account admin ko submit,
+    user ka access khatam (status='error')."""
+    with _db_lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE accounts SET status='error', error_at=?, error_by=?, assigned_to=NULL "
+            "WHERE username=? AND status='assigned'",
+            (now_str(), tid, username),
+        )
+        return cur.rowcount > 0
 
 
-def main_menu_keyboard():
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("💰 Balance"), KeyboardButton("📊 Campaign")],
-            [KeyboardButton("👥 Accounts"), KeyboardButton("➕ Login")],
-            [
-                KeyboardButton("🎬 Browse Series"),
-                KeyboardButton("🎬 Watch All (4x)"),
-            ],
-            [
-                KeyboardButton("🧠 Quiz Status"),
-                KeyboardButton("🤖 Run Quiz"),
-            ],
-            [KeyboardButton("🔑 Set Groq Key"), KeyboardButton("🔑 Token Login")],
-            [KeyboardButton("ℹ️ Help")],
-        ],
-        resize_keyboard=True,
-    )
+def last_finished(tid: int):
+    """User ka sabse recent khatam hua account (done ya error)."""
+    with _conn() as c:
+        r = c.execute(
+            "SELECT * FROM accounts WHERE done_by=? OR error_by=? "
+            "ORDER BY COALESCE(done_at, error_at) DESC LIMIT 1",
+            (tid, tid),
+        ).fetchone()
+        return dict(r) if r else None
 
 
-def build_series_keyboard(series_page, total_pages, page_series):
-    kb = []
-    for s in page_series:
-        sid = str(s.get("_id") or s.get("id") or s.get("series_id") or "")
-        if not sid:
+def list_errors():
+    with _conn() as c:
+        rows = c.execute("SELECT * FROM accounts WHERE status='error' ORDER BY error_at").fetchall()
+        return [dict(r) for r in rows]
+
+
+def archive_errors() -> int:
+    with _db_lock, _conn() as c:
+        cur = c.execute("UPDATE accounts SET status='archived' WHERE status='error'")
+        return cur.rowcount
+
+
+def list_done():
+    with _conn() as c:
+        rows = c.execute("SELECT * FROM accounts WHERE status='done' ORDER BY done_at").fetchall()
+        return [dict(r) for r in rows]
+
+
+def archive_done() -> int:
+    with _db_lock, _conn() as c:
+        cur = c.execute("UPDATE accounts SET status='archived' WHERE status='done'")
+        return cur.rowcount
+
+
+def per_user_done() -> list:
+    """[(telegram_id, username, first_name, completed_count), ...]"""
+    with _conn() as c:
+        rows = c.execute(
+            """
+            SELECT a.done_by AS tid, u.username AS uname, u.first_name AS fname, COUNT(*) AS n
+            FROM accounts a
+            LEFT JOIN users u ON u.telegram_id = a.done_by
+            WHERE a.status IN ('done','archived') AND a.done_by IS NOT NULL
+            GROUP BY a.done_by
+            ORDER BY n DESC
+            """
+        ).fetchall()
+        return [(r["tid"], r["uname"], r["fname"], r["n"]) for r in rows]
+
+
+def current_holders() -> list:
+    """[(telegram_id, username, first_name, count), ...] — abhi kis user ke paas kitne."""
+    with _conn() as c:
+        rows = c.execute(
+            """
+            SELECT a.assigned_to AS tid, u.username AS uname, u.first_name AS fname, COUNT(*) AS n
+            FROM accounts a
+            LEFT JOIN users u ON u.telegram_id = a.assigned_to
+            WHERE a.status='assigned'
+            GROUP BY a.assigned_to
+            ORDER BY n DESC
+            """
+        ).fetchall()
+        return [(r["tid"], r["uname"], r["fname"], r["n"]) for r in rows]
+
+
+# ---------- txt parser ----------
+def _strip_prefix(s: str) -> str:
+    """Line ke aage ka emoji/symbol hata do: '👤 User: x' → 'User: x'."""
+    return re.sub(r"^[^A-Za-z0-9]+", "", (s or "").strip()).strip()
+
+
+def parse_accounts_text(text: str) -> list:
+    """Admin ki txt ko accounts list me convert karo. Formats support:
+
+    A) test.py format (emoji ke saath ya bina):
+         👤 User: @username
+         🔑 Pass: password
+         🔐 2FA Key: BASE32
+         🆔 Session ID: ...      (optional)
+         📧 Email: ...           (optional)
+    B) simple pipe:  username|password|2fa   (aur  username:password)
+    """
+    lines = [ln.rstrip() for ln in (text or "").splitlines()]
+    if not lines:
+        return []
+
+    has_kv = any(_strip_prefix(ln).lower().startswith(("user:", "pass:")) for ln in lines)
+    out = []
+
+    if has_kv:
+        cur = {}
+
+        def flush():
+            nonlocal cur
+            if cur.get("username") and cur.get("password"):
+                out.append({
+                    "username": cur["username"],
+                    "password": cur["password"],
+                    "twofa_secret": cur.get("twofa_secret", ""),
+                    "session_id": cur.get("session_id", ""),
+                    "email": cur.get("email", ""),
+                })
+            cur = {}
+
+        for ln in lines:
+            n = _strip_prefix(ln)
+            if not n:
+                continue
+            low = n.lower()
+            if low.startswith("user:"):
+                if cur.get("username"):
+                    flush()
+                cur["username"] = n.split(":", 1)[1].strip().lstrip("@")
+            elif low.startswith("pass:"):
+                cur["password"] = n.split(":", 1)[1].strip()
+            elif low.startswith("2fa key:") or low.startswith("2fa:"):
+                cur["twofa_secret"] = n.split(":", 1)[1].strip()
+            elif low.startswith("session id:"):
+                v = n.split(":", 1)[1].strip()
+                if v and v.upper() != "N/A":
+                    cur["session_id"] = v
+            elif low.startswith("email:"):
+                cur["email"] = n.split(":", 1)[1].strip()
+        flush()
+        return out
+
+    # pipe / colon format
+    for ln in lines:
+        s = ln.strip()
+        if not s or s.startswith("#"):
             continue
-        title = (s.get("title") or s.get("name") or "(no title)")[:32]
-        n_ep = int(s.get("numberOfEpisodes") or s.get("totalEpisodes") or 0)
-        sid_short = sid if len(sid) <= 10 else sid[:7] + ".."
-        label = f"[{sid_short}] {title}  [{n_ep}ep]"
-        kb.append([InlineKeyboardButton(label, callback_data=f"sr_sel:{sid}")])
-    nav = []
-    if series_page > 1:
-        nav.append(
-            InlineKeyboardButton("⬅️ Prev", callback_data=f"sr_pg:{series_page-1}")
-        )
-    nav.append(
-        InlineKeyboardButton(f"📄 {series_page}/{total_pages}", callback_data="sr_noop")
-    )
-    if series_page < total_pages:
-        nav.append(
-            InlineKeyboardButton("Next ➡️", callback_data=f"sr_pg:{series_page+1}")
-        )
-    if nav:
-        kb.append(nav)
-    return InlineKeyboardMarkup(kb)
+        if "|" in s:
+            parts = [p.strip() for p in s.split("|")]
+            if len(parts) >= 2 and parts[0] and parts[1]:
+                out.append({
+                    "username": parts[0].lstrip("@"),
+                    "password": parts[1],
+                    "twofa_secret": parts[2] if len(parts) > 2 else "",
+                    "session_id": parts[3] if len(parts) > 3 else "",
+                    "email": "",
+                })
+        elif s.count(":") == 1:
+            u, p = s.split(":", 1)
+            if u.strip() and p.strip():
+                out.append({"username": u.strip().lstrip("@"), "password": p.strip(),
+                            "twofa_secret": "", "session_id": "", "email": ""})
+    return out
 
 
-def build_episode_keyboard(series_id, ep_status, series_title=None):
-    kb = []
-    header = []
-    kb.append(
-        [
-            InlineKeyboardButton(
-                f"🔥 Watch ALL (4x) This Series",
-                callback_data=f"sr_all4x:{series_id}",
-            )
-        ]
-    )
-    kb.append(
-        [
-            InlineKeyboardButton(
-                f"🔙 Back to Series List", callback_data="sr_back"
-            )
-        ]
-    )
-    row = []
-    for idx, st in enumerate(ep_status):
-        ep = st["episode"]
-        n = ep.get("episodeNo") or ep.get("episode_no") or idx + 1
-        w = st["watches"]
-        if w >= MAX_WATCHES_PER_EP:
-            icon = "✔"
-        elif w > 0:
-            icon = f"{w}/4"
-        else:
-            icon = "▶"
-        label = f"E{n} {icon}"
-        row.append(
-            InlineKeyboardButton(
-                label, callback_data=f"sr_ep:{series_id}:{n}"
-            )
-        )
-        if len(row) == 4:
-            kb.append(row)
-            row = []
-    if row:
-        kb.append(row)
-    return InlineKeyboardMarkup(kb)
+# ================== BOT LOGIC ==================
+def is_admin(tid: int) -> bool:
+    return tid in ADMIN_IDS
 
 
-# ───────────────────── Telegram Handlers ─────────────────────
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    bot = get_bot(user.id)
-    text = (
-        f"👋 Hi {user.first_name}!\n\n"
-        "MiniPix Unified Bot ready.\n\n"
-        "🔐 *Login*\n"
-        "• /login – OTP (Phone) login\n"
-        "• /tokenlogin `<token>` – direct Bearer token login\n\n"
-        "🎬 *Watch*\n"
-        "• /series – browse series (button me `[series_id]` dikhta hai)\n"
-        "• /watch – Smart 4x Watch *ALL* series (Option 11)\n"
-        "• /watch `<SERIES_ID>` – uss SERIES ke saare eps 4x watch\n\n"
-        "🧠 *Quiz*\n"
-        "• /setgroq `gsk_xxx` – apna Groq key set karo\n"
-        "• /quizrun – Auto Quiz solve (Groq AI)\n"
-        "• /quiz – quiz status\n"
-    )
-    if bot.access_token:
-        text += f"\n✅ Logged in: {bot.current_account_label or bot.phone}"
-    else:
-        text += "\n⚠️ Not logged in → /login"
-    await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+def can_work(tid: int) -> bool:
+    return is_admin(tid) or is_approved(tid)
 
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "📖 *Commands*\n\n"
-
-        "➡️ *Login & Accounts*\n"
-        "/login – OTP (Phone) ya Bearer Token login\n"
-        "/tokenlogin `JWT_TOKEN` – direct token login (2 tarike)\n"
-        "/accounts – saved accounts list / switch\n"
-        "/logout – logout\n\n"
-
-        "➡️ *Series / Watch*\n"
-        "/series `[page]` – list all series (with ID)\n"
-        "/watch – Option 11: *ALL* series 4x smart watch\n"
-        "/watch `SERIES_ID` – *specific* series ke saare episodes 4x watch\n\n"
-
-        "➡️ *Quiz*\n"
-        "/quiz – quiz status (hearts, daily cap)\n"
-        "/quizrun – Groq AI auto quiz solve\n"
-        "/setgroq `gsk_xxx` – apna Groq API key set\n"
-        "/mygroq – Groq key check\n\n"
-
-        "➡️ *Misc*\n"
-        "/start – main menu\n"
-        "/balance – coin balance\n"
-        "/campaign – campaign + daily cap\n\n"
-
-        "---\n\n"
-
-        "🔑 *Token Ka Format (Kaise Milega?)*\n\n"
-
-        "Bearer token *MiniPix app ka auth token* hai. Ye `HTTP Toolkit` ya `Fiddler Classic` se packet capture karke milta hai:\n\n"
-
-        "1. HTTP Toolkit / Fiddler ko open karo\n"
-        "2. MiniPix app open karo → login karo\n"
-        "3. App ke kisi request ko capture karo (jisme `Authorization` header ho)\n"
-        "4. Usme dikhe: `Authorization: Bearer eyJhbGciOiJIUzI1NiIs...`\n"
-        "5. Wo *pura JWT* (`eyJ` se start hone wala long string) yaha bhejo:\n\n"
-
-        "```\n"
-        "/tokenlogin eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiI2N...wxyz\n"
-        "```\n\n"
-
-        "Token starts with: `eyJ` (always)\n"
-        "Token length: 200+ chars\n"
-        "⚠️ Token 30 din baad expire hota hai → tab naya lagana padega.\n\n"
-
-        "Free Groq key: https://console.groq.com/keys"
-    )
-    await update.message.reply_text(
-        help_text, parse_mode="Markdown", reply_markup=main_menu_keyboard()
-    )
-
-
-async def set_groq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(
-            "Usage:\n`/setgroq gsk_your_key_here`\n\n"
-            "Free key: https://console.groq.com/keys",
-            parse_mode="Markdown",
-        )
-        return
-
-    key = context.args[0].strip()
-    if not key.startswith("gsk_"):
-        await update.message.reply_text("❌ Invalid key. Must start with `gsk_`")
-        return
-
-    user_id = str(update.effective_user.id)
-    user_groq_keys[user_id] = key
-    save_user_groq_keys(user_groq_keys)
-    await update.message.reply_text("✅ Groq API key saved!\nAb quiz use kar sakte ho.")
-
-
-async def my_groq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    key = get_user_groq_key(update.effective_user.id)
-    if key:
-        masked = key[:10] + "..." + key[-4:]
-        await update.message.reply_text(f"✅ Key set: `{masked}`", parse_mode="Markdown")
-    else:
-        await update.message.reply_text(
-            "❌ Koi key set nahi hai.\n\n`/setgroq gsk_xxxxxxxx`",
-            parse_mode="Markdown",
-        )
-
-
-async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot = get_bot(update.effective_user.id)
-    if not bot.access_token:
-        await update.message.reply_text("Not logged in. Use /login")
-        return
-    coins = bot.get_balance()
-    if coins is None:
-        await update.message.reply_text("Failed to fetch balance")
-    else:
-        await update.message.reply_text(
-            f"💰 Coin Balance: *{coins}*", parse_mode="Markdown"
-        )
-
-
-async def campaign_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot = get_bot(update.effective_user.id)
-    if not bot.access_token:
-        await update.message.reply_text("Not logged in.")
-        return
-    st = bot.get_campaign_status()
-    text = (
-        f"🎥 Campaign: {'ON' if st['enabled'] else 'OFF'}\n"
-        f"Daily cap: {st['used']}/{st['cap']}\n"
-        f"Reached: {st['reached']}"
-    )
-    await update.message.reply_text(text)
-
-
-async def accounts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot = get_bot(update.effective_user.id)
-    accs = bot.list_accounts()
-    if not accs:
-        await update.message.reply_text("No saved accounts.")
-        return
-    lines = [f"👥 Saved Accounts ({len(accs)}):\n"]
-    keyboard = []
-    for i, lbl in enumerate(accs, 1):
-        acc = bot.accounts[lbl]
-        ph = acc.get("phone") or "?"
-        lines.append(f"{i}. {lbl}  |  {ph}")
-        keyboard.append(
-            [
-                InlineKeyboardButton(f"Switch → {lbl}", callback_data=f"sw:{lbl}"),
-                InlineKeyboardButton("❌", callback_data=f"rm:{lbl}"),
-            ]
-        )
-    await update.message.reply_text(
-        "\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def account_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    bot = get_bot(query.from_user.id)
-    if data.startswith("sw:"):
-        label = data[3:]
-        ok, msg = bot.switch_account(label)
-        if ok:
-            bot.open_app()
-            bal = bot.get_balance()
-            await query.edit_message_text(f"✅ {msg}\n💰 Balance: {bal}")
-        else:
-            await query.edit_message_text(f"❌ {msg}")
-    elif data.startswith("rm:"):
-        label = data[3:]
-        if bot.remove_account(label):
-            await query.edit_message_text(f"Removed: {label}")
-        else:
-            await query.edit_message_text("Remove failed")
-
-
-# ───────── Browse Series ─────────
-async def series_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    bot = get_bot(uid)
-    if not bot.access_token:
-        await update.message.reply_text("Not logged in. Use /login")
-        return
-    page = 1
-    if context.args:
+def notify_admins(text: str, reply_markup: dict = None):
+    for aid in ADMIN_IDS:
         try:
-            page = max(1, int(context.args[0]))
-        except Exception:
-            page = 1
-    msg = await update.message.reply_text("📚 Series list load ho rahi hai...")
-    try:
-        page_series, total, total_pages, cur_page = bot.get_series_list_paginated(
-            page=page, per_page=10
+            tg.send_message(aid, text, reply_markup=reply_markup)
+        except Exception as e:
+            print(f"[!] admin notify failed ({aid}): {e}")
+
+
+def name_of(u: dict) -> str:
+    if not u:
+        return "?"
+    return u.get("username") or u.get("first_name") or str(u.get("telegram_id"))
+
+
+# ---------- keyboards ----------
+def user_kb(tid: int) -> dict:
+    has = get_active_for_user(tid) is not None
+    rows = []
+    if has:
+        rows.append([{"text": "🔐 Get OTP", "callback_data": "u:otp"},
+                     {"text": "👤 My Account", "callback_data": "u:myacc"}])
+        rows.append([{"text": "✅ Task Done", "callback_data": "u:done"},
+                     {"text": "⚠️ Problem", "callback_data": "u:problem"}])
+    else:
+        rows.append([{"text": "📥 Get Account", "callback_data": "u:get"}])
+        rows.append([{"text": "👤 My Account", "callback_data": "u:myacc"}])
+    return {"inline_keyboard": rows}
+
+
+def admin_kb() -> dict:
+    return {"inline_keyboard": [
+        [{"text": "📊 Stats", "callback_data": "a:stats"},
+         {"text": "⬇️ Get Done", "callback_data": "a:get"}],
+        [{"text": "⚠️ Get Problems", "callback_data": "a:errors"},
+         {"text": "👥 Users", "callback_data": "a:users"}],
+        [{"text": "📤 Upload Help", "callback_data": "a:upload"}],
+    ]}
+
+
+def approve_kb(tid: int) -> dict:
+    return {"inline_keyboard": [[
+        {"text": "✅ Approve", "callback_data": f"a:approve:{tid}"},
+        {"text": "❌ Reject", "callback_data": f"a:reject:{tid}"},
+    ]]}
+
+
+# ---------- user actions ----------
+def esc(s) -> str:
+    return html.escape(str(s if s is not None else ""), quote=False)
+
+
+def account_text(acc: dict) -> str:
+    """User ko account (tap-to-copy) — test.py jaisa format."""
+    return (f"👤 User: @<code>{esc(acc['username'])}</code>\n"
+            f"🔑 Pass: <code>{esc(acc['password'])}</code>\n")
+
+
+def _account_full_text(acc: dict) -> str:
+    """Admin ke liye poore details (plain text)."""
+    lines = [f"👤 User: @{acc.get('username', '')}", f"🔑 Pass: {acc.get('password', '')}"]
+    if acc.get("session_id"):
+        lines.append(f"🆔 Session ID: {acc['session_id']}")
+    if acc.get("twofa_secret"):
+        lines.append(f"🔐 2FA Key: {acc['twofa_secret']}")
+    if acc.get("email"):
+        lines.append(f"📧 Email: {acc['email']}")
+    return "\n".join(lines)
+
+
+def do_get_account(tid: int, chat_id: int):
+    if not can_work(tid):
+        tg.send_message(chat_id, "⛔ Aapko access nahi hai. Admin se approve karwao — /start bhejo.")
+        return
+    active = get_active_for_user(tid)
+    if active:
+        tg.send_message(
+            chat_id,
+            "⚠️ Aapke paas pehle se ek account active hai. Pehle use '✅ Task Done' karo.\n\n"
+            + account_text(active),
+            reply_markup=user_kb(tid),
+            parse_mode="HTML",
         )
+        return
+    acc = assign_account(tid)
+    if not acc:
+        tg.send_message(chat_id, "📭 Abhi koi account available nahi hai. Admin se naye accounts daalne ko bolo.",
+                        reply_markup=user_kb(tid))
+        return
+    tg.send_message(
+        chat_id,
+        "🎯 Account mil gaya\n\n"
+        + account_text(acc)
+        + "\n2FA OTP chahiye to '🔐 Get OTP' dabao (jab tak chahiye).\n"
+          "Kaam poorA hone par '✅ Task Done' dabao.",
+        reply_markup=user_kb(tid),
+        parse_mode="HTML",
+    )
+
+
+def do_otp(tid: int, chat_id: int):
+    active = get_active_for_user(tid)
+    if not active:
+        tg.send_message(chat_id, "Koi active account nahi. Pehle '📥 Get Account' dabao.",
+                        reply_markup=user_kb(tid))
+        return
+    secret = (active.get("twofa_secret") or "").strip()
+    if not secret:
+        tg.send_message(chat_id, f"ℹ️ @{active['username']} me 2FA set nahi hai (koi key nahi).",
+                        reply_markup=user_kb(tid))
+        return
+    try:
+        code, remaining = totp_with_remaining(secret)
     except Exception as e:
-        await msg.edit_text(f"❌ Series load fail: {e}")
+        tg.send_message(chat_id, f"[!] OTP generate nahi hua: {e}", reply_markup=user_kb(tid))
         return
-    kb = build_series_keyboard(cur_page, total_pages, page_series)
-    text_lines = [
-        f"📚 *Series List* — Page {cur_page}/{total_pages}  ({total} total)",
+    tg.send_message(
+        chat_id,
+        f"🔐 OTP: <code>{code}</code>\n"
+        f"⏳ Valid ~{remaining}s\n\n"
+        f"(@{esc(active['username'])} ke liye — turant use karo, 30s me badal jayega)",
+        reply_markup=user_kb(tid),
+        parse_mode="HTML",
+    )
+
+
+def do_done(tid: int, chat_id: int):
+    active = get_active_for_user(tid)
+    if not active:
+        tg.send_message(chat_id, "Koi active account nahi. Pehle '📥 Get Account' dabao.",
+                        reply_markup=user_kb(tid))
+        return
+    uname = active["username"]
+    if mark_done(uname, tid):
+        tg.send_message(
+            chat_id,
+            f"✅ @{uname} done mark ho gaya!\n\n"
+            "Ab is account ka aapka access khatam — ID/pass/OTP band.\n"
+            "Naya account lene ke liye '📥 Get Account' dabao.",
+            reply_markup=user_kb(tid),
+        )
+        notify_admins(f"✅ @{uname} → done by {name_of(get_user(tid))} ({tid})")
+    else:
+        tg.send_message(chat_id, "⚠️ Done mark nahi ho paaya (account assigned nahi hai?).",
+                        reply_markup=user_kb(tid))
+
+
+def do_report_problem(tid: int, chat_id: int):
+    """Task me problem → account admin ko submit, user ka access khatam."""
+    active = get_active_for_user(tid)
+    if not active:
+        tg.send_message(chat_id, "Koi active account nahi. Pehle '📥 Get Account' dabao.",
+                        reply_markup=user_kb(tid))
+        return
+    uname = active["username"]
+    if report_problem(uname, tid):
+        tg.send_message(
+            chat_id,
+            f"⚠️ @{uname} admin ko submit kar diya (problem / not complete).\n\n"
+            "Ab is account ka aapka access khatam. Naya account lene ke liye '📥 Get Account' dabao.",
+            reply_markup=user_kb(tid),
+        )
+        notify_admins(
+            "⚠️ Problem / Not-complete report\n"
+            f"Reported by: {name_of(get_user(tid))} ({tid})\n\n"
+            + _account_full_text(active)
+        )
+    else:
+        tg.send_message(chat_id, "⚠️ Report nahi ho paaya.", reply_markup=user_kb(tid))
+
+
+def do_my_account(tid: int, chat_id: int):
+    active = get_active_for_user(tid)
+    if active:
+        tg.send_message(chat_id, "👤 Your current account\n\n" + account_text(active),
+                        reply_markup=user_kb(tid), parse_mode="HTML")
+        return
+    last = last_finished(tid)
+    if last and last.get("done_by") == tid:
+        tg.send_message(chat_id, f"✅ Completed: @{esc(last['username'])}",
+                        reply_markup=user_kb(tid), parse_mode="HTML")
+        return
+    if last:
+        tg.send_message(chat_id, f"⚠️ Reported (admin ko submit): @{esc(last['username'])}",
+                        reply_markup=user_kb(tid), parse_mode="HTML")
+        return
+    tg.send_message(chat_id, "Aapke paas abhi koi account nahi hai.", reply_markup=user_kb(tid))
+
+
+# ---------- admin actions ----------
+def do_stats(chat_id: int):
+    s = stats()
+    per = per_user_done()
+    holders = current_holders()
+    lines = [
+        "📊 BOT STATS",
+        f"📦 Total: {s['total']}",
+        f"📥 Available: {s['available']}",
+        f"🔄 In-progress (assigned): {s['assigned']}",
+        f"✅ Done: {s['done']}",
+        f"⚠️ Problems (error): {s['error']}",
+        f"🗄 Archived (exported): {s['archived']}",
         "",
-        "Button mein `[series_id]` dikh raha hai. Use karo:",
-        "`/watch <series_id>` → us series ke SARE episodes 4x watch",
-        "",
-        "Icons:",
-        "`▶` Not watched",
-        "`1/4–3/4` Watched N times",
-        "`✔` 4x complete (max reward)",
-        "",
-        "Ya kisi series par tap karo → episode menu dikhega.",
+        "👥 Completed per user:",
     ]
-    await msg.edit_text("\n".join(text_lines), parse_mode="Markdown", reply_markup=kb)
+    if per:
+        for tid, uname, fname, n in per:
+            lines.append(f"  • {uname or fname or tid} ({tid}) → {n}")
+    else:
+        lines.append("  (abhi kisi ne complete nahi kiya)")
+    lines.append("")
+    lines.append("🔄 Currently holding:")
+    if holders:
+        for tid, uname, fname, n in holders:
+            lines.append(f"  • {uname or fname or tid} ({tid}) → {n}")
+    else:
+        lines.append("  (koi account kisi ke paas nahi)")
+    tg.send_message(chat_id, "\n".join(lines), reply_markup=admin_kb())
 
 
-async def series_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    uid = query.from_user.id
-    bot = get_bot(uid)
-    data = query.data
-
-    if data == "sr_noop":
+def do_get_done(chat_id: int):
+    rows = list_done()
+    if not rows:
+        tg.send_message(chat_id, "📭 Abhi koi 'done' account nahi hai.", reply_markup=admin_kb())
         return
-
-    if not bot.access_token:
-        await query.edit_message_text("Not logged in. Use /login")
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    fn = EXPORT_DIR / f"done_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+    out = [f"FURMAN DONE EXPORT — {stamp}", f"Total: {len(rows)} account(s)", "=" * 50]
+    for i, r in enumerate(rows, 1):
+        out.append(f"\n[{i}]")
+        out.append(f"👤 User: @{r['username']}")
+        out.append(f"🔑 Pass: {r['password']}")
+        if r.get("session_id"):
+            out.append(f"🆔 Session ID: {r['session_id']}")
+        if r.get("twofa_secret"):
+            out.append(f"🔐 2FA Key: {r['twofa_secret']}")
+        if r.get("email"):
+            out.append(f"📧 Email: {r['email']}")
+        out.append(f"✅ Done by: {r.get('done_by')}")
+        out.append(f"🕒 Done at: {r.get('done_at')}")
+    fn.write_text("\n".join(out), encoding="utf-8")
+    try:
+        tg.send_document(chat_id, fn, caption=f"⬇️ {len(rows)} done account(s)\n🕒 {stamp}")
+    except Exception as e:
+        tg.send_message(chat_id, f"[!] file bhejne me error: {e}")
         return
+    n = archive_done()
+    tg.send_message(chat_id, f"🗄 {n} account(s) archived (ab active list se hat gaye).",
+                    reply_markup=admin_kb())
 
-    if data.startswith("sr_pg:"):
-        page = int(data[6:] or "1")
-        try:
-            page_series, total, total_pages, cur_page = bot.get_series_list_paginated(
-                page=page, per_page=10
-            )
-        except Exception as e:
-            await query.edit_message_text(f"❌ Series load fail: {e}")
+
+def do_get_errors(chat_id: int):
+    """Problem/not-complete accounts admin ko txt me do, phir archive."""
+    rows = list_errors()
+    if not rows:
+        tg.send_message(chat_id, "📭 Abhi koi problem/error account nahi hai.", reply_markup=admin_kb())
+        return
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    fn = EXPORT_DIR / f"errors_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+    out = [f"FURMAN PROBLEM/ERROR EXPORT — {stamp}", f"Total: {len(rows)} account(s)", "=" * 50]
+    for i, r in enumerate(rows, 1):
+        out.append(f"\n[{i}]")
+        out.append(f"👤 User: @{r['username']}")
+        out.append(f"🔑 Pass: {r['password']}")
+        if r.get("session_id"):
+            out.append(f"🆔 Session ID: {r['session_id']}")
+        if r.get("twofa_secret"):
+            out.append(f"🔐 2FA Key: {r['twofa_secret']}")
+        if r.get("email"):
+            out.append(f"📧 Email: {r['email']}")
+        out.append(f"⚠️ Reported by: {r.get('error_by')}")
+        out.append(f"🕒 Reported at: {r.get('error_at')}")
+    fn.write_text("\n".join(out), encoding="utf-8")
+    try:
+        tg.send_document(chat_id, fn, caption=f"⚠️ {len(rows)} problem account(s)\n🕒 {stamp}")
+    except Exception as e:
+        tg.send_message(chat_id, f"[!] file bhejne me error: {e}")
+        return
+    n = archive_errors()
+    tg.send_message(chat_id, f"🗄 {n} problem account(s) archived.", reply_markup=admin_kb())
+
+
+def do_users(chat_id: int):
+    users = list_users()
+    if not users:
+        tg.send_message(chat_id, "Koi user nahi. (Admin ko chhod kar)", reply_markup=admin_kb())
+        return
+    per = {tid: n for tid, _, _, n in per_user_done()}
+    lines = ["👥 USERS", ""]
+    for u in users:
+        tid = u["telegram_id"]
+        mark = "✅" if u["approved"] else "⏳"
+        tag = " (admin)" if is_admin(tid) else ""
+        lines.append(f"{mark} {name_of(u)} — {tid}{tag}\n     completed: {per.get(tid, 0)}")
+    lines.append("\n✅ = approved, ⏳ = pending")
+    tg.send_message(chat_id, "\n".join(lines), reply_markup=admin_kb())
+
+
+def do_upload_help(chat_id: int):
+    tg.send_message(
+        chat_id,
+        "📤 Accounts add karna\n\n"
+        "Do tarike — dono chalenge:\n"
+        "• Ek `.txt` file bhejo (document ke roop me), YA\n"
+        "• Account ka text seedha yahan paste karke bhej do.\n\n"
+        "Format (emoji ke saath ya bina):\n"
+        "   👤 User: @username\n"
+        "   🔑 Pass: password\n"
+        "   🔐 2FA Key: BASE32SECRET\n"
+        "   🆔 Session ID: ...      (optional)\n"
+        "   📧 Email: ...           (optional)\n\n"
+        "2) Simple pipe:\n"
+        "   username|password|2fa_secret\n\n"
+        "Ek hi file me bahut accounts ho sakte hain. Duplicate username skip ho jayega.",
+        reply_markup=admin_kb(),
+    )
+
+
+# ---------- routing ----------
+def handle_message(msg: dict):
+    chat = msg.get("chat", {})
+    tid = chat.get("id")
+    if tid is None:
+        return
+    frm = msg.get("from", {})
+    upsert_user(tid, frm.get("username", ""), frm.get("first_name", ""))
+
+    # admin sends a txt file → ingest accounts
+    if msg.get("document"):
+        if not is_admin(tid):
+            tg.send_message(tid, "⛔ Sirf admin accounts upload kar sakta hai.")
             return
-        kb = build_series_keyboard(cur_page, total_pages, page_series)
-        text = (
-            f"📚 *Series List* — Page {cur_page}/{total_pages}  ({total} total)\n\n"
-            "Kisi series par click karo → episodes + watch options dikhenge."
-        )
-        await query.edit_message_text(
-            text, parse_mode="Markdown", reply_markup=kb
-        )
+        ingest_document(tid, msg["document"])
         return
 
-    if data == "sr_back":
-        try:
-            page_series, total, total_pages, cur_page = bot.get_series_list_paginated(
-                page=1, per_page=10
-            )
-        except Exception as e:
-            await query.edit_message_text(f"❌ Series load fail: {e}")
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return
+    cmd = text.split()[0].lower().split("@")[0]
+    args = text.split()[1:]
+
+    # ---- admin commands ----
+    if is_admin(tid):
+        # admin ne seedha text paste kiya (account data) → add karo
+        if not text.startswith("/") and looks_like_accounts(text):
+            ingest_text(tid, text, source="pasted text")
             return
-        kb = build_series_keyboard(cur_page, total_pages, page_series)
-        text = f"📚 *Series List* — Page {cur_page}/{total_pages}  ({total} total)"
-        await query.edit_message_text(
-            text, parse_mode="Markdown", reply_markup=kb
-        )
-        return
-
-    if data.startswith("sr_sel:"):
-        sid = data[7:]
-        try:
-            detail = bot.get_series_detail(sid)
-        except Exception as e:
-            await query.edit_message_text(f"❌ Series detail fail: {e}")
+        if cmd in ("/admin", "/panel"):
+            tg.send_message(tid, "🛠 Admin Panel", reply_markup=admin_kb())
             return
-        info = detail.get("series") or {}
-        title = (info.get("title") or info.get("name") or f"Series {sid}")[:60]
-        total_eps = detail.get("total_episodes") or 0
-        ep_status = detail.get("ep_status") or []
-        kb = build_episode_keyboard(sid, ep_status, series_title=title)
-        summary_parts = []
-        done = maxed = 0
-        for st in ep_status:
-            if st["watches"] >= MAX_WATCHES_PER_EP:
-                maxed += 1
-            if st["watches"] >= 1:
-                done += 1
-        text = (
-            f"🎞️ *{title}*\n"
-            f"Total episodes: {total_eps}\n"
-            f"Progress: {done}/{total_eps} started | "
-            f"{maxed}/{total_eps} 4x-complete\n\n"
-            "• Tap `E1`, `E2`... → 1 episode watch\n"
-            "• Tap *🔥 Watch ALL (4x) This Series* → full series smart-repeat"
-        )
-        await query.edit_message_text(
-            text, parse_mode="Markdown", reply_markup=kb
-        )
+        if cmd == "/stats":
+            do_stats(tid)
+            return
+        if cmd in ("/get", "/done"):
+            do_get_done(tid)
+            return
+        if cmd in ("/errors", "/problems"):
+            do_get_errors(tid)
+            return
+        if cmd == "/users":
+            do_users(tid)
+            return
+        if cmd == "/upload":
+            do_upload_help(tid)
+            return
+        if cmd == "/adduser" and args:
+            try:
+                uid = int(args[0])
+            except ValueError:
+                tg.send_message(tid, "Usage: /adduser <telegram_id>")
+                return
+            set_approved(uid, True)
+            tg.send_message(tid, f"✅ User {uid} approved.")
+            try:
+                tg.send_message(uid, "✅ Aapko access mil gaya! /start dabao aur account lo.")
+            except Exception:
+                pass
+            return
+        if cmd == "/removeuser" and args:
+            try:
+                uid = int(args[0])
+            except ValueError:
+                tg.send_message(tid, "Usage: /removeuser <telegram_id>")
+                return
+            remove_user(uid)
+            tg.send_message(tid, f"🗑 User {uid} hata diya.")
+            return
+        if cmd == "/release" and args:
+            try:
+                uid = int(args[0])
+            except ValueError:
+                tg.send_message(tid, "Usage: /release <telegram_id>")
+                return
+            n = release_user(uid)
+            tg.send_message(tid, f"♻️ {n} account(s) wapas available kiye (user {uid}).")
+            return
+
+    # ---- basic commands ----
+    if cmd in ("/start", "/help"):
+        on_start(tid, frm)
+        return
+    if cmd in ("/myid", "/id"):
+        tg.send_message(tid, f"🆔 Aapki Telegram ID: {tid}")
+        return
+    if cmd in ("/get", "/getaccount"):
+        do_get_account(tid, tid)
+        return
+    if cmd == "/otp":
+        do_otp(tid, tid)
+        return
+    if cmd == "/done":
+        do_done(tid, tid)
+        return
+    if cmd in ("/myaccount", "/my"):
+        do_my_account(tid, tid)
         return
 
-    if data.startswith("sr_ep:"):
+    # fallback
+    if not can_work(tid):
+        tg.send_message(tid, "⛔ Access nahi hai. /start bhejo (admin approve karega).")
+    else:
+        tg.send_message(tid, "Samajh nahi aaya. /start dabao.", reply_markup=user_kb(tid))
+
+
+def on_start(tid: int, frm: dict):
+    if is_admin(tid):
+        tg.send_message(tid, "🛠 Admin Panel\n/stats /get /errors /users /adduser <id> /upload",
+                        reply_markup=admin_kb())
+        return
+    if can_work(tid):
+        tg.send_message(
+            tid,
+            "👋 Welcome!\n\n"
+            "Yahan se Instagram account lekar uska 2FA OTP log le sakte ho aur professional "
+            "banane ke baad 'Done' report kar sakte ho.\n\n"
+            "Ek time par ek hi account milega — Done karne ke baad next milega.",
+            reply_markup=user_kb(tid),
+        )
+        return
+    # pending
+    upsert_user(tid, frm.get("username", ""), frm.get("first_name", ""))
+    tg.send_message(tid, "⏳ Aapka access request bhej diya gaya hai. Admin approve karega, phir try karo.")
+    notify_admins(
+        f"🔔 Access request\n{name_of(get_user(tid))} ({tid}) ne access maanga.",
+        reply_markup=approve_kb(tid),
+    )
+
+
+def looks_like_accounts(text: str) -> bool:
+    """Message me account data lagta hai? (User:/Pass: ya pipe format)"""
+    t = text or ""
+    if "|" in t and " " not in t.split("|", 1)[0].strip():
+        return True
+    for ln in t.splitlines():
+        n = _strip_prefix(ln).lower()
+        if n.startswith(("user:", "pass:")):
+            return True
+    return False
+
+
+def ingest_text(tid: int, text: str, source: str = "text"):
+    """Text (ya txt file) se accounts pool me add karo."""
+    rows = parse_accounts_text(text)
+    if not rows:
+        tg.send_message(tid, f"⚠️ {source} me koi valid account nahi mila. Format check karo (/upload).")
+        return
+    added, skipped = add_accounts(rows)
+    s = stats()
+    tg.send_message(
+        tid,
+        f"✅ Upload done ({source})\n"
+        f"➕ Added: {added}\n"
+        f"⏭ Skipped (duplicate/invalid): {skipped}\n\n"
+        f"📥 Available now: {s['available']} | 🔄 Assigned: {s['assigned']} | ✅ Done: {s['done']}",
+        reply_markup=admin_kb(),
+    )
+
+
+def ingest_document(tid: int, doc: dict):
+    name = doc.get("file_name", "file.txt")
+    if not name.lower().endswith((".txt", ".csv")):
+        tg.send_message(tid, f"⚠️ '{name}' txt nahi lagti. Phir bhi try kar raha hoon...")
+    tg.send_chat_action(tid, "typing")
+    try:
+        raw = tg.download_file(doc["file_id"])
+    except Exception as e:
+        tg.send_message(tid, f"[!] file download fail: {e}")
+        return
+    ingest_text(tid, raw.decode("utf-8", errors="ignore"), source=name)
+
+
+def handle_callback(cb: dict):
+    data = cb.get("data", "")
+    frm = cb.get("from", {})
+    tid = frm.get("id")
+    cb_id = cb.get("id")
+    msg = cb.get("message", {})
+    chat_id = msg.get("chat", {}).get("id", tid)
+
+    if data.startswith("u:"):
+        action = data[2:]
+        if not can_work(tid):
+            tg.answer_callback(cb_id, "Access nahi hai. /start bhejo.", show_alert=True)
+            return
+        tg.answer_callback(cb_id)
+        if action == "get":
+            do_get_account(tid, chat_id)
+        elif action == "otp":
+            do_otp(tid, chat_id)
+        elif action == "done":
+            do_done(tid, chat_id)
+        elif action == "problem":
+            do_report_problem(tid, chat_id)
+        elif action == "myacc":
+            do_my_account(tid, chat_id)
+        return
+
+    if data.startswith("a:"):
+        if not is_admin(tid):
+            tg.answer_callback(cb_id, "Sirf admin.", show_alert=True)
+            return
         parts = data.split(":")
-        if len(parts) < 3:
-            return
-        sid = parts[1]
-        ep_no = parts[2]
-        busy_lock = get_user_busy_lock(uid)
-        if not busy_lock.acquire(blocking=False):
-            await query.answer(
-                "⏳ Pehle se ek task chal raha hai.", show_alert=True
-            )
-            return
-        try:
-            msg = await query.message.reply_text(
-                f"▶️ Starting S{sid} E{ep_no}...\n(1 episode = ~10s)"
-            )
-            loop = asyncio.get_running_loop()
-
-            def progress(text):
+        action = parts[1]
+        if action == "stats":
+            tg.answer_callback(cb_id)
+            do_stats(chat_id)
+        elif action == "get":
+            tg.answer_callback(cb_id)
+            do_get_done(chat_id)
+        elif action == "errors":
+            tg.answer_callback(cb_id)
+            do_get_errors(chat_id)
+        elif action == "users":
+            tg.answer_callback(cb_id)
+            do_users(chat_id)
+        elif action == "upload":
+            tg.answer_callback(cb_id)
+            do_upload_help(chat_id)
+        elif action in ("approve", "reject"):
+            uid = int(parts[2])
+            if action == "approve":
+                set_approved(uid, True)
+                tg.answer_callback(cb_id, "Approved ✅")
+                tg.edit_message_text(chat_id, msg.get("message_id"), f"✅ Approved user {uid}")
                 try:
-                    loop.call_soon_threadsafe(
-                        lambda: asyncio.create_task(
-                            msg.edit_text(
-                                f"▶️ S{sid} E{ep_no}…\n\n{str(text)[-1200:]}"
-                            )
-                        )
-                    )
+                    tg.send_message(uid, "✅ Aapko access mil gaya! /start dabao.")
                 except Exception:
                     pass
-
-            def work():
-                return bot.watch_one_episode(
-                    series_id=sid,
-                    episode_no=ep_no,
-                    progress_callback=progress,
-                    telegram_user_id=uid,
-                )
-
-            result = await loop.run_in_executor(None, work)
-
-            if isinstance(result, dict) and result.get("error"):
-                await msg.edit_text(f"❌ {result['error']}")
             else:
-                ok = result.get("ok") if isinstance(result, dict) else False
-                status = result.get("status") if isinstance(result, dict) else "?"
-                nth = result.get("nth_watch") if isinstance(result, dict) else "?"
-                reward = result.get("reward_expected") if isinstance(result, dict) else "?"
-                delta = result.get("delta") if isinstance(result, dict) else None
-                bal_after = result.get("balance_after") if isinstance(result, dict) else None
-                t = (
-                    f"🏁 Episode done: S{sid} E{ep_no}\n"
-                    f"Result: {'✅' if ok else '❌'} status={status}\n"
-                    f"Watch #{nth} (expected +{reward})\n"
-                )
-                if delta is not None:
-                    t += f"💰 Delta: {delta:+d}  |  Balance now: {bal_after}"
-                await msg.edit_text(t)
-        finally:
-            try:
-                busy_lock.release()
-            except Exception:
-                pass
-        return
-
-    if data.startswith("sr_all4x:"):
-        sid = data[9:]
-        busy_lock = get_user_busy_lock(uid)
-        if not busy_lock.acquire(blocking=False):
-            await query.answer(
-                "⏳ Pehle se ek task chal raha hai.", show_alert=True
-            )
-            return
-        try:
-            if not bot.access_token:
-                await query.edit_message_text("Not logged in.")
-                return
-            msg = await query.message.reply_text(
-                f"🔥 Starting SMART 4x repeat for series {sid}..."
-            )
-            loop = asyncio.get_running_loop()
-
-            def progress(text):
+                remove_user(uid)
+                tg.answer_callback(cb_id, "Rejected ❌")
+                tg.edit_message_text(chat_id, msg.get("message_id"), f"❌ Rejected user {uid}")
                 try:
-                    loop.call_soon_threadsafe(
-                        lambda: asyncio.create_task(
-                            msg.edit_text(
-                                f"🔥 Series 4x Watch S{sid}…\n\n{str(text)[-1400:]}"
-                            )
-                        )
-                    )
+                    tg.send_message(uid, "❌ Aapki request reject kar di gayi.")
                 except Exception:
                     pass
-
-            def work():
-                return bot.watch_single_series_smart_repeat(
-                    series_id=sid,
-                    progress_callback=progress,
-                    telegram_user_id=uid,
-                )
-
-            result = await loop.run_in_executor(None, work)
-
-            if isinstance(result, dict) and result.get("error"):
-                await msg.edit_text(f"❌ {result['error']}")
-                return
-            watched = result.get("watched", 0) if isinstance(result, dict) else 0
-            skip = result.get("skipped", 0) if isinstance(result, dict) else 0
-            fail = result.get("failed", 0) if isinstance(result, dict) else 0
-            t = (
-                f"🏁 Series 4x done: {result.get('series_title', sid)}\n\n"
-                f"Watched: {watched}\nSkip: {skip}\nFail: {fail}\n"
-            )
-            if isinstance(result, dict) and result.get("delta") is not None:
-                t += (
-                    f"💰 {result['balance_before']} → {result['balance_after']} "
-                    f"({result['delta']:+d})"
-                )
-            await msg.edit_text(t)
-        finally:
-            try:
-                busy_lock.release()
-            except Exception:
-                pass
-        return
-
-
-async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("📱 Phone + OTP", callback_data="login:otp")],
-        [InlineKeyboardButton("🔑 Bearer Token", callback_data="login:token")],
-    ]
-    await update.message.reply_text(
-        "Choose login method:", reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def login_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "login:otp":
-        await query.edit_message_text("Phone number bhejo (+91... ya 98...):")
-        return WAIT_PHONE
-    elif query.data == "login:token":
-        await query.edit_message_text(
-            "*Bearer Token* bhejo:\n\n"
-            "Format: `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQi...`\n"
-            "(hamesha `eyJ` se start hota hai, ~200+ characters)\n\n"
-            "Token kaise milega: HTTP Toolkit/Fiddler se MiniPix app ke requests me "
-            "`Authorization: Bearer <TOKEN>` header pakad ke.",
-            parse_mode="Markdown",
-        )
-        return WAIT_TOKEN
-    return ConversationHandler.END
-
-
-async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = update.message.text.strip()
-    if not phone.startswith("+"):
-        phone = "+91" + phone.lstrip("0")
-    if not re.match(r"^\+[1-9]\d{1,14}$", phone):
-        await update.message.reply_text(
-            "❌ Invalid phone number. Use format: +91XXXXXXXXXX"
-        )
-        return WAIT_PHONE
-
-    context.user_data["phone"] = phone
-    bot = get_bot(update.effective_user.id)
-    st = bot.login_otp_generate(phone)
-    if not st:
-        await update.message.reply_text(
-            "❌ OTP bhejne me fail. Check:\n"
-            "• Phone number is correct\n"
-            "• Internet connection\n"
-            "• Server is reachable\n\n"
-            "Try again with /login"
-        )
-        return ConversationHandler.END
-    context.user_data["session_token"] = st
-    await update.message.reply_text(f"✅ OTP sent to {phone}\nAb OTP bhejo:")
-    return WAIT_OTP
-
-
-async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    otp = update.message.text.strip()
-    bot = get_bot(update.effective_user.id)
-    st = context.user_data.get("session_token")
-    if not st:
-        await update.message.reply_text("Session lost. /login se start karo.")
-        return ConversationHandler.END
-    ok = bot.login_otp_verify(st, otp)
-    if ok:
-        bot.open_app()
-        bal = bot.get_balance()
-        await update.message.reply_text(
-            f"✅ Login success!\n💰 Balance: {bal}",
-            reply_markup=main_menu_keyboard(),
-        )
-    else:
-        await update.message.reply_text(
-            "❌ OTP verify failed. Check OTP and try again."
-        )
-    return ConversationHandler.END
-
-
-async def login_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    token = update.message.text.strip()
-    if token.lower().startswith("bearer "):
-        token = token[7:].strip()
-    if len(token) < 20:
-        await update.message.reply_text(
-            "❌ Token too short (< 20 chars).\nValid JWT token `eyJ` se start hota hai aur 200+ chars ka hota hai.\nCancel: /cancel",
-        )
-        return WAIT_TOKEN
-    if not token.startswith("eyJ"):
-        await update.message.reply_text(
-            "⚠️ Token `eyJ` se start nahi ho raha (JWT nahi lag raha). Phir bhi try kar raha hoon...\n(Cancel: /cancel)",
-        )
-    bot = get_bot(update.effective_user.id)
-    ok = bot.login_with_token(token)
-    if ok:
-        bot.open_app()
-        bal = bot.get_balance()
-        await update.message.reply_text(
-            f"✅ Token Login Success!\n💰 Balance: {bal}",
-            reply_markup=main_menu_keyboard(),
-        )
-    else:
-        await update.message.reply_text(
-            "❌ Invalid ya expired token.\nCheck:\n"
-            "• Token complete hai? (start `eyJ` + end with chars)\n"
-            "• Token expire to nahi ho gaya? (HTTP Toolkit se naya capture karo)\n"
-            "Cancel: /cancel",
-        )
-    return ConversationHandler.END
-
-
-async def tokenlogin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        help_token = (
-            "*Usage:*\n"
-            "`/tokenlogin eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiI2Nz...xxxx`\n\n"
-
-            "*Token Properties:*\n"
-            "• *Always starts with*: `eyJ` (JWT format)\n"
-            "• *Length*: ~200 to 500 characters\n"
-            "• *Validity*: ~30 din ke baad expire hota hai\n\n"
-
-            "*Kaise Milega Token?*\n"
-            "HTTP Toolkit / Fiddler Classic se:\n"
-            "1. HTTP Toolkit/Fiddler start karo (SSL Proxy on)\n"
-            "2. MiniPix app open karo → login karo (OTP se)\n"
-            "3. App ka koi bhi request dekhna hai (jisme `Authorization` header ho)\n"
-            "4. Request headers me:\n"
-            "   `Authorization: Bearer eyJhbGciOiJIUzI1NiIs...`\n"
-            "5. `Bearer ` ke *baad* ka pura string copy karo → yehi apna TOKEN hai\n\n"
-
-            "*Alternative method:*\n"
-            "Chat me `/login` → choose `🔑 Bearer Token` → token send karo.\n\n"
-
-            "⚠️ *Note:* Bot auto-strips `Bearer ` prefix. Seedha `eyJ...` wala bhejo ya poora `Bearer eyJ...` dono chalega."
-        )
-        await update.message.reply_text(help_token, parse_mode="Markdown")
-        return
-    token = " ".join(context.args).strip()
-    if token.lower().startswith("bearer "):
-        token = token[7:].strip()
-    if len(token) < 20:
-        await update.message.reply_text(
-            "❌ Token too short (< 20 chars).\nReal JWT token hamesha `eyJ` se start hota hai aur 200+ characters ka hota hai.",
-        )
-        return
-    if not token.startswith("eyJ"):
-        await update.message.reply_text(
-            "⚠️ *Warning:* Token `eyJ` se start nahi ho raha (valid JWT nahi lag raha).\n"
-            "Try kar raha hoon fir bhi...",
-            parse_mode="Markdown",
-        )
-    bot = get_bot(update.effective_user.id)
-    ok = bot.login_with_token(token)
-    if ok:
-        bot.open_app()
-        bal = bot.get_balance()
-        await update.message.reply_text(
-            f"✅ Token Login Success!\n💰 Balance: {bal}",
-            reply_markup=main_menu_keyboard(),
-        )
-    else:
-        await update.message.reply_text(
-            "❌ Token login FAILED.\n"
-            "Check:\n"
-            "1. Token `eyJ` se start hota hai?\n"
-            "2. Token complete paste kiya? (copy karte waqt last/start ka hissa na chop ho)\n"
-            "3. Token expire to nahi ho gaya? (dobara HTTP Toolkit se capture karo)\n"
-        )
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Cancelled.", reply_markup=main_menu_keyboard())
-    return ConversationHandler.END
-
-
-async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    busy_lock = get_user_busy_lock(uid)
-    if not busy_lock.acquire(blocking=False):
-        await update.message.reply_text(
-            "⏳ Pehle se ek task chal raha hai. Wait karo ya usko poora hone do."
-        )
-        return
-    try:
-        bot = get_bot(uid)
-        if not bot.access_token:
-            await update.message.reply_text("Not logged in. Use /login")
-            return
-
-        series_id_arg = None
-        if context.args:
-            series_id_arg = str(context.args[0]).strip()
-            if not series_id_arg:
-                series_id_arg = None
-
-        if series_id_arg:
-            msg = await update.message.reply_text(
-                f"🔥 Starting SMART 4x repeat for Series `{series_id_arg}`...\n"
-                "(series detail + episodes load ho rahe hain)",
-                parse_mode="Markdown",
-            )
-            mode_label = f"Series {series_id_arg}"
         else:
-            msg = await update.message.reply_text(
-                "🚀 Starting Smart 4x Watch (Option 11 mode)...\nThoda time lagega."
-            )
-            mode_label = "Opt11 ALL"
-
-        loop = asyncio.get_running_loop()
-
-        def progress(text):
-            try:
-                loop.call_soon_threadsafe(
-                    lambda: asyncio.create_task(
-                        msg.edit_text(
-                            f"🚀 Watching ({mode_label})…\n\n{str(text)[-1400:]}"
-                        )
-                    )
-                )
-            except Exception:
-                pass
-
-        def work():
-            if series_id_arg:
-                return bot.watch_single_series_smart_repeat(
-                    series_id=series_id_arg,
-                    progress_callback=progress,
-                    telegram_user_id=uid,
-                )
-            return bot.browse_and_watch_all_smart_repeat(
-                progress_callback=progress,
-                max_watches=250,
-                telegram_user_id=uid,
-            )
-
-        result = await loop.run_in_executor(None, work)
-
-        if isinstance(result, dict) and "error" in result:
-            await msg.edit_text(f"❌ {result['error']}")
-            return
-
-        watched = result.get("watched", 0) if isinstance(result, dict) else 0
-        skipped = result.get("skipped", 0) if isinstance(result, dict) else 0
-        failed = result.get("failed", 0) if isinstance(result, dict) else 0
-        text = (
-            f"🏁 Watch finished ({mode_label})\n\n"
-            f"Watched: {watched}\n"
-            f"Skipped: {skipped}\n"
-            f"Failed: {failed}\n"
-        )
-        if isinstance(result, dict) and result.get("delta") is not None:
-            text += (
-                f"💰 {result['balance_before']} → {result['balance_after']} "
-                f"({result['delta']:+d})"
-            )
-        await msg.edit_text(text)
-    finally:
-        try:
-            busy_lock.release()
-        except Exception:
-            pass
-
-
-async def quiz_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot = get_bot(update.effective_user.id)
-    if not bot.access_token:
-        await update.message.reply_text("Not logged in.")
+            tg.answer_callback(cb_id)
         return
-    data = bot.get_quiz_status()
-    if not data:
-        await update.message.reply_text("Failed to get quiz status")
-        return
-    lvl = data.get("currentLevel", "?")
-    cfg = data.get("levelConfig", {}) or {}
-    hearts = data.get("hearts", {}) or {}
-    daily = data.get("dailyAttempts", {}) or {}
-    totals = data.get("totals", {}) or {}
-    text = (
-        f"🧠 Quiz Status\n\n"
-        f"Level: {lvl}\n"
-        f"Qs: {cfg.get('questionsCount')} | +{cfg.get('coinsPerCorrect')}/correct\n"
-        f"Hearts: {hearts.get('freePerLevel')}/level\n"
-        f"Daily: {daily.get('used')}/{daily.get('limit')} "
-        f"{'[EXHAUSTED]' if daily.get('exhausted') else ''}\n"
-        f"Lifetime coins: {totals.get('coins')}"
-    )
-    await update.message.reply_text(text)
+
+    tg.answer_callback(cb_id)
 
 
-async def quiz_run_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot = get_bot(update.effective_user.id)
-    if not bot.access_token:
-        await update.message.reply_text("Not logged in.")
-        return ConversationHandler.END
-
-    if not get_user_groq_key(update.effective_user.id):
-        await update.message.reply_text(
-            "❌ Pehle apna Groq API key set karo:\n\n"
-            "`/setgroq gsk_xxxxxxxx`\n\n"
-            "Free key: https://console.groq.com/keys",
-            parse_mode="Markdown",
-        )
-        return ConversationHandler.END
-
-    await update.message.reply_text("Kitne quiz sessions? (10-25, default 15):")
-    return WAIT_QUIZ_SESSIONS
-
-
-async def quiz_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        n = int(update.message.text.strip() or "15")
-        n = max(10, min(25, n))
-    except Exception:
-        n = 15
-    context.user_data["quiz_sessions"] = n
-
-    uid = update.effective_user.id
-    busy_lock = get_user_busy_lock(uid)
-    if not busy_lock.acquire(blocking=False):
-        await update.message.reply_text(
-            "⏳ Pehle se ek task chal raha hai. Wait karo."
-        )
-        return ConversationHandler.END
-
-    try:
-        bot = get_bot(uid)
-        sessions = context.user_data.get("quiz_sessions", 15)
-
-        msg = await update.message.reply_text(
-            f"🤖 Running {sessions} sessions (delay 10s)..."
-        )
-
-        loop = asyncio.get_running_loop()
-
-        def progress(text):
-            try:
-                loop.call_soon_threadsafe(
-                    lambda: asyncio.create_task(
-                        msg.edit_text(
-                            f"🤖 Quiz running…\n\n{str(text)[-1400:]}"
-                        )
-                    )
-                )
-            except Exception:
-                pass
-
-        def work():
-            return bot.run_quiz_auto(
-                max_sessions=sessions,
-                question_delay=QUIZ_QUESTION_DELAY,
-                progress_callback=progress,
-                telegram_user_id=uid,
-            )
-
-        result = await loop.run_in_executor(None, work)
-
-        if isinstance(result, dict) and "error" in result:
-            await msg.edit_text(f"❌ {result['error']}")
-        else:
-            sessions_done = result.get("sessions") if isinstance(result, dict) else "?"
-            total_coins = (
-                result.get("total_coins") if isinstance(result, dict) else "?"
-            )
-            balance = result.get("balance") if isinstance(result, dict) else "?"
-            await msg.edit_text(
-                f"🏁 Quiz done\n"
-                f"Sessions: {sessions_done}\n"
-                f"Coins this run: ~{total_coins}\n"
-                f"Current balance: {balance}"
-            )
-    finally:
-        try:
-            busy_lock.release()
-        except Exception:
-            pass
-    return ConversationHandler.END
-
-
-async def logout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot = get_bot(update.effective_user.id)
-    bot._reset_state()
-    await update.message.reply_text("Logged out.", reply_markup=main_menu_keyboard())
-
-
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    if text == "💰 Balance":
-        await balance_cmd(update, context)
-    elif text == "📊 Campaign":
-        await campaign_cmd(update, context)
-    elif text == "👥 Accounts":
-        await accounts_cmd(update, context)
-    elif text == "➕ Login":
-        await login_start(update, context)
-    elif text == "🎬 Browse Series":
-        await series_cmd(update, context)
-    elif text == "🎬 Watch All (4x)":
-        await watch_cmd(update, context)
-    elif text == "🧠 Quiz Status":
-        await quiz_status_cmd(update, context)
-    elif text == "🤖 Run Quiz":
-        return await quiz_run_start(update, context)
-    elif text == "🔑 Set Groq Key":
-        await update.message.reply_text(
-            "Apna Groq key bhejo:\n`/setgroq gsk_xxxxxxxx`\n\n"
-            "Free key: https://console.groq.com/keys",
-            parse_mode="Markdown",
-        )
-    elif text == "🔑 Token Login":
-        await update.message.reply_text(
-            "*Token Login (2 Methods)*\n\n"
-
-            "Method 1 (Fast): `/tokenlogin <your_token>`\n"
-            "Example:\n"
-            "`/tokenlogin eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQi...`\n\n"
-
-            "Method 2 (Interactive): /login → tap *🔑 Bearer Token*\n\n"
-
-            "*Token Properties:*\n"
-            "• JWT hamesha `eyJ` se start hota hai\n"
-            "• Length ~ 200-500 chars\n"
-            "• HTTP Toolkit/Fiddler se MiniPix ke request ka "
-            "`Authorization: Bearer <TOKEN>` header pakad ke nikalo.\n\n"
-
-            "Full help: /help",
-            parse_mode="Markdown",
-        )
-    elif text == "ℹ️ Help":
-        await help_cmd(update, context)
-    else:
-        await update.message.reply_text("Unknown. Use /help")
-
-
+# ================== MAIN ==================
 def main():
-    acquire_lock()
-
-    if not TELEGRAM_BOT_TOKEN:
-        print("ERROR: Set TELEGRAM_BOT_TOKEN")
+    if "PASTE" in BOT_TOKEN or not BOT_TOKEN.strip():
+        print("=" * 60)
+        print("SETUP NEEDED:")
+        print("  1) @BotFather se NAYA bot banao → token copy karo")
+        print("  2) Project root me .env banao (ya env var set karo):")
+        print("       BOT_TOKEN=<token>")
+        print("       ADMIN_IDS=<apni telegram id>       # /myid se pata chalti hai")
+        print("  3) Phir chalao:  python profbot\\bot.py")
+        print("=" * 60)
         return
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    db_init()
+    try:
+        me = tg.get_me()
+    except Exception as e:
+        print(f"[!] bot token check fail: {e}")
+        return
+    print(f"[*] bot @{me.get('username')} chal raha hai. Admin ids: {sorted(ADMIN_IDS)}")
+    print("[*] rukne ke liye Ctrl+C")
 
-    login_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(login_callback, pattern=r"^login:")],
-        states={
-            WAIT_PHONE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone)
-            ],
-            WAIT_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_otp)],
-            WAIT_TOKEN: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, login_token)
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-
-    quiz_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("quizrun", quiz_run_start),
-            MessageHandler(filters.Regex("^🤖 Run Quiz$"), quiz_run_start),
-        ],
-        states={
-            WAIT_QUIZ_SESSIONS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, quiz_sessions)
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("balance", balance_cmd))
-    app.add_handler(CommandHandler("campaign", campaign_cmd))
-    app.add_handler(CommandHandler("accounts", accounts_cmd))
-    app.add_handler(CommandHandler("login", login_start))
-    app.add_handler(CommandHandler("tokenlogin", tokenlogin_cmd))
-    app.add_handler(CommandHandler("series", series_cmd))
-    app.add_handler(CommandHandler("watch", watch_cmd))
-    app.add_handler(CommandHandler("quiz", quiz_status_cmd))
-    app.add_handler(CommandHandler("setgroq", set_groq))
-    app.add_handler(CommandHandler("mygroq", my_groq))
-    app.add_handler(CommandHandler("logout", logout_cmd))
-    app.add_handler(CallbackQueryHandler(account_callback, pattern=r"^(sw|rm):"))
-    app.add_handler(
-        CallbackQueryHandler(
-            series_callback,
-            pattern=r"^(sr_(pg|sel|ep|all4x|noop|back))",
-        )
-    )
-    app.add_handler(login_conv)
-    app.add_handler(quiz_conv)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-
-    print("Bot starting (lock acquired). Unified mode.")
-    if LOG_CHANNEL_ID:
-        print(f"Log/DATA channel enabled: {LOG_CHANNEL_ID}")
-    else:
-        print("WARNING: LOG_CHANNEL_ID not set")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    offset = None
+    while True:
+        try:
+            updates = tg.get_updates(offset, timeout=30)
+        except KeyboardInterrupt:
+            print("\n[*] bye")
+            break
+        except Exception as e:
+            print(f"[!] getUpdates error: {e}")
+            time.sleep(3)
+            continue
+        for u in updates:
+            offset = u["update_id"] + 1
+            try:
+                if "message" in u:
+                    handle_message(u["message"])
+                elif "callback_query" in u:
+                    handle_callback(u["callback_query"])
+            except Exception:
+                traceback.print_exc()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[*] bye")
